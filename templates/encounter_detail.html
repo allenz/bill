@@ -1,0 +1,241 @@
+<!doctype html>
+<html>
+<head>
+<title>Encounter {{ id }}</title>
+<style>
+  body { font-family: sans-serif; margin: 1em; }
+  a { margin-right: 1em; }
+
+  table { border-collapse: collapse; }
+  th, td { text-align: left; padding: 2px 1.5em 2px 0; }
+  th { font-weight: bold; }
+
+  td.num { text-align: right; }
+
+  /* Free-text details (notes, message, ...) keep their line breaks */
+  td.pre { white-space: pre-wrap; max-width: 40em; }
+
+  /* The parsed progress note: h3 = the section (Subjective, ...),
+     h4 = an item or block heading (Chief complaints, ...),
+     div.sub = a category sub-heading (Tobacco Use, ENT, ...) with its
+     content lines, indented under the block; p.pre = a text line */
+  .note h3 { margin: 0.9em 0 0.25em; }
+  .note h4 { margin: 0.6em 0 0.1em; font-size: 1em; }
+  .note div.sub { margin: 0.3em 0 0.3em 1em; }
+  .note div.sub h5 { margin: 0 0 0.1em; font-size: 0.92em; color: #444; }
+  .note p.pre { white-space: pre-wrap; margin: 0 0 0.3em; }
+
+  .result-link { color: #0b5ed7; cursor: pointer; }
+  .result-link:hover { text-decoration: underline; }
+
+  /* Unreviewed labs (status 0 from a lab source) render bold */
+  #labsTable tr.unreviewed td { font-weight: bold; }
+
+  /* Popup with the result details for the clicked lab row */
+  #result-modal {
+    position: fixed; inset: 0;
+    background: rgba(0, 0, 0, 0.4);
+    display: none;
+    align-items: center; justify-content: center;
+    z-index: 2000;
+  }
+  #result-modal.open { display: flex; }
+  #result-modal-card {
+    background: #fff; border-radius: 6px;
+    width: min(700px, 90vw); max-height: 80vh;
+    overflow: auto;
+    padding: 1em 1.5em;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  }
+  #result-modal-header { display: flex; justify-content: space-between; align-items: center; }
+  #result-modal-title { font-weight: bold; }
+  /* 44px touch target for the close button (touch devices) */
+  #result-modal-close {
+    cursor: pointer; font-size: 1.5em; font-weight: bold; line-height: 1;
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 44px; min-height: 44px; margin: -11px 0;
+    border-radius: 8px;
+  }
+  #result-modal-close:hover { background: rgba(0, 0, 0, 0.06); }
+  #result-modal-close:active { background: rgba(0, 0, 0, 0.12); }
+  #result-modal-body table { border-collapse: collapse; margin-top: 0.5em; width: 100%; }
+  #result-modal-body th, #result-modal-body td { text-align: left; padding: 3px 1em 3px 0; vertical-align: top; }
+  #result-modal-body thead th { font-weight: bold; }
+  #result-modal-body pre.result-notes {
+    margin: 0.5em 0 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: inherit;
+    line-height: 1.4;
+  }
+  /* values with a nonempty flag render bold red, except 'N' (normal) */
+  #result-modal-body td.flagged { font-weight: bold; color: #b91c1c; }
+  /* paramNotes can be multi-line preformatted text (e.g. the NIH LDL goals
+     ASCII table): keep the line breaks, monospace so it aligns */
+  #result-modal-body td.notes { white-space: pre-wrap; font-family: monospace; font-size: 1.5em; }
+</style>
+</head>
+<body>
+  {% set active = "Encounter" %}
+  {% include "header_nav.html" %}
+  <h1>{{ heading }}</h1>
+  {# patient_line is pre-escaped HTML: the MRN linking to the patient page. #}
+  <p>{{ patient_line | safe }}</p>
+
+  <h2>Details</h2>
+  <table>
+    <tbody>
+{{ details_body | safe }}
+    </tbody>
+  </table>
+
+  {% if note %}
+  <h2>Note</h2>
+  <div class="note">
+{{ note | safe }}
+  </div>
+  {% endif %}
+
+  {% if report_body %}
+  <h2>Report</h2>
+  <table>
+    <thead>
+      <tr>{{ report_header | safe }}</tr>
+    </thead>
+    <tbody>
+{{ report_body | safe }}
+    </tbody>
+  </table>
+  {% endif %}
+
+  {% if lab_summary %}
+  <p id="labSummary">{{ lab_summary }}</p>
+  {% endif %}
+  {% if labs_body %}
+  <h2>Labs</h2>
+  <table id="labsTable">
+    <thead>
+      <tr><th>name</th><th>!</th><th>date</th><th>collected</th><th>result_date</th><th>lab</th><th>result</th><th>type</th></tr>
+    </thead>
+    <tbody>
+{{ labs_body | safe }}
+    </tbody>
+  </table>
+  {% endif %}
+
+  {% if claim_body %}
+  <h2>Payments</h2>
+  <table>
+    <thead>
+      <tr>{{ claim_header | safe }}</tr>
+    </thead>
+    <tbody>
+{{ claim_body | safe }}
+    </tbody>
+  </table>
+  {% endif %}
+
+  <div id="result-modal">
+    <div id="result-modal-card">
+      <div id="result-modal-header">
+        <span id="result-modal-title"></span>
+        <span id="result-modal-close" title="Close">&times;</span>
+      </div>
+      <div id="result-modal-body"></div>
+    </div>
+  </div>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+  // Popup: result details for the clicked lab row (fetches /api/lab_result).
+  // Clicking the same link again, the x, or Esc closes it.
+  const RESULT_FIELDS = ['itemName', 'value', 'units', 'range', 'flag', 'paramNotes'];
+  const modal = document.getElementById('result-modal');
+  const modalTitle = document.getElementById('result-modal-title');
+  const modalBody = document.getElementById('result-modal-body');
+  let openLab = null;
+
+  function closeResultModal() {
+    openLab = null;
+    modal.classList.remove('open');
+    modalTitle.textContent = '';
+    modalBody.replaceChildren();
+  }
+
+  async function showResultModal(labId, name) {
+    if (openLab === labId) { closeResultModal(); return; }
+    openLab = labId;
+    modal.classList.add('open');
+    modalTitle.textContent = `Results for ${name || labId}`;
+    modalBody.textContent = 'Loading\u2026';
+    try {
+      const res = await fetch(`/api/lab_result?id=${encodeURIComponent(labId)}`);
+      if (res.status === 409) {
+        // The interface had no reports for this lab yet.
+        modalBody.textContent = 'No result available yet';
+        return;
+      }
+      if (!res.ok) throw new Error(await res.text());
+      const results = await res.json();
+      if (results.some((r) => r.notes != null && r.notes !== '')) {
+        // im (imaging) rows: the result is a single notes field holding the
+        // full report text; show it directly instead of the field table.
+        const pre = document.createElement('pre');
+        pre.className = 'result-notes';
+        pre.textContent = results
+          .map((r) => r.notes)
+          .filter((n) => n != null && n !== '')
+          .join('\n\n');
+        modalBody.replaceChildren(pre);
+        return;
+      }
+      const table = document.createElement('table');
+      const thead = document.createElement('thead');
+      const headRow = document.createElement('tr');
+      for (const field of RESULT_FIELDS) {
+        const th = document.createElement('th');
+        th.textContent = field;
+        headRow.append(th);
+      }
+      thead.append(headRow);
+      const tbody = document.createElement('tbody');
+      for (const r of results) {
+        const tr = document.createElement('tr');
+        for (const field of RESULT_FIELDS) {
+          const td = document.createElement('td');
+          td.textContent = r[field] == null ? '' : r[field];
+          const flag = r.flag == null ? '' : String(r.flag).trim();
+          if (field === 'value' && flag && flag !== 'N') {
+            td.className = 'flagged';
+          } else if (field === 'paramNotes' && td.textContent) {
+            // Multi-line preformatted text (e.g. the NIH LDL goals ASCII
+            // table): keep the line breaks, monospace so it aligns.
+            td.className = 'notes';
+          }
+          tr.append(td);
+        }
+        tbody.append(tr);
+      }
+      table.append(thead, tbody);
+      modalBody.replaceChildren(table);
+    } catch (err) {
+      modalBody.textContent = `Failed to load results: ${err.message}`;
+    }
+  }
+
+  // Delegated: the rows are static (server-rendered), so one handler on the
+  // table covers every "view" link. The table is absent when the encounter
+  // has no labs.
+  const labsTable = document.getElementById('labsTable');
+  if (labsTable) {
+    labsTable.addEventListener('click', (e) => {
+      const link = e.target.closest('a.result-link');
+      if (link) showResultModal(link.dataset.lab, link.dataset.name);
+    });
+  }
+  document.getElementById('result-modal-close').addEventListener('click', closeResultModal);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeResultModal(); });
+});
+</script>
+</body>
+</html>

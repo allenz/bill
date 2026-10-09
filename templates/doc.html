@@ -1,0 +1,151 @@
+<!doctype html>
+<html>
+<head>
+<title>Doc</title>
+<style>
+  body { font-family: sans-serif; margin: 1em; }
+  a { margin-right: 1em; }
+  .topbar { display: flex; justify-content: space-between; align-items: baseline; }
+  .topbar-right { display: flex; align-items: baseline; gap: 1.5em; }
+  #doc-status { font-weight: bold; }
+  #doc-status.saving { color: #0b5ed7; }
+  #doc-status.error { color: #b00020; }
+  #doc-updated { font-size: 0.9em; }
+  #doc {
+    display: block;
+    width: calc(100% - 0.5em);
+    min-height: 75vh;
+    margin-top: 0.25em;
+    padding: 0.75em;
+    font-family: monospace;
+    font-size: 18px;
+    line-height: 1.4;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    resize: vertical;
+  }
+  #doc:disabled { background-color: #f0f0f0; color: #999; }
+</style>
+</head>
+<body>
+  {% set active = "Doc" %}
+  {% include "header_nav.html" %}
+  <div class="topbar">
+    <h1>Doc</h1>
+    <div class="topbar-right">
+      <span id="doc-status"></span>
+      <span id="doc-updated"
+            {% if updated_tip %}title="{{ updated_tip }}"{% endif %}>
+        {% if updated %}Doc updated {{ updated }}{% if updated_by %} by {{ updated_by }}{% endif %}{% else %}Doc not saved yet{% endif %}
+      </span>
+    </div>
+  </div>
+  <textarea id="doc" spellcheck="false">{{ body }}</textarea>
+
+<script>
+// The shared notepad. Edits autosave (debounced) via /api/doc; the server
+// broadcasts each save on the /ws/doc socket so the other open tabs update
+// in place. Edits are assumed infrequent and from one user at a time.
+const docEl = document.getElementById('doc');
+const statusEl = document.getElementById('doc-status');
+const updatedEl = document.getElementById('doc-updated');
+
+let inFlight = false;      // a save request is outstanding
+let saveTimer = null;      // the debounced save
+let statusClearTimer = null;
+
+function setStatus(text, cls = '') {
+  statusEl.textContent = text;
+  statusEl.className = cls;
+}
+
+// While the browser is offline, lock the note so edits can only happen
+// while connected (like the report page's editable cells).
+function setDocLocked(locked) {
+  docEl.disabled = locked;
+}
+setDocLocked(!navigator.onLine);
+window.addEventListener('offline', () => setDocLocked(true));
+window.addEventListener('online', () => setDocLocked(false));
+
+async function save() {
+  const value = docEl.value;
+  inFlight = true;
+  setStatus('Saving…', 'saving');
+  try {
+    const res = await fetch('/api/doc', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ body: value }),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    // The server echoes this back to every tab; this tab already holds the
+    // text, so its doc_update is skipped below.
+    setStatus('Saved', 'ok');
+    clearTimeout(statusClearTimer);
+    statusClearTimer = setTimeout(
+      () => { if (statusEl.textContent === 'Saved') setStatus(''); }, 1200);
+    updatedEl.textContent = 'Doc updated just now';
+    updatedEl.title = '';
+    // More was typed while this save was in flight: save it again.
+    if (docEl.value !== value) scheduleSave();
+  } catch (err) {
+    console.error('doc save failed:', err);
+    setStatus('Failed to save; retrying', 'error');
+    saveTimer = setTimeout(save, 2000);
+  } finally {
+    inFlight = false;
+  }
+}
+
+// Debounce the autosave; input during an in-flight save is picked up by
+// save()'s follow-up check instead.
+function scheduleSave() {
+  if (inFlight) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(save, 800);
+}
+docEl.addEventListener('input', scheduleSave);
+
+// Apply a doc_update broadcast (another tab, or this tab's own save). Never
+// clobber text this tab is currently typing (focused textarea holding
+// different, not-yet-saved text), and skip the echo when the value already
+// matches.
+function applyDocUpdate(msg) {
+  if (document.activeElement === docEl && docEl.value !== msg.body) return;
+  if (docEl.value !== msg.body) docEl.value = msg.body;
+  updatedEl.textContent = msg.updated_by
+    ? `Doc updated just now by ${msg.updated_by}`
+    : 'Doc updated just now';
+  updatedEl.title = '';
+}
+
+// The server pushes JSON messages on the /ws/doc socket:
+//   {"type": "doc_update", "body": "...", "updated_by": "alice"}
+const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+// The websocket reconnects whenever it drops, so cross-tab sync is restored
+// as soon as connectivity returns.
+function connectDocSocket() {
+  const sock = new WebSocket(wsProto + '//' + window.location.host + '/ws/doc');
+  sock.onmessage = (event) => {
+    let msg;
+    try {
+      msg = JSON.parse(event.data);
+    } catch {
+      console.warn('non-JSON websocket payload:', event.data);
+      return;
+    }
+    if (msg.type === 'doc_update') {
+      applyDocUpdate(msg);
+    } else {
+      console.warn('Unexpected websocket message:', msg);
+    }
+  };
+  sock.onclose = () => {
+    setTimeout(connectDocSocket, 2000);  // keep trying to reconnect
+  };
+}
+connectDocSocket();
+</script>
+</body>
+</html>

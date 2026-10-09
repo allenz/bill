@@ -1,0 +1,31 @@
+<!doctype html>
+<html>
+<head>
+<title>Schedule</title>
+<style>
+  body { font-family: sans-serif; margin: 1em; }
+  a { margin-right: 1em; }
+  table { border-collapse: collapse; }
+  th, td { border: 1px solid #ccc; padding: 2px 8px; text-align: left; }
+  th { background: #eee; }
+</style>
+</head>
+<body>
+  {% set active = "Schedule" %}
+  {% include "header_nav.html" %}
+  <h1>{{ heading }}</h1>
+  <p>
+    <a href="/schedule?date={{ prev_date }}">Prev</a>
+    <a href="/schedule?date={{ next_date }}">Next</a>
+    {% if date != today_date %}<a href="/schedule">Today</a>{% endif %}
+  </p>
+  <table>
+    <thead>
+      <tr>{{ header | safe }}</tr>
+    </thead>
+    <tbody>
+{{ body | safe }}
+    </tbody>
+  </table>
+</body>
+</html>

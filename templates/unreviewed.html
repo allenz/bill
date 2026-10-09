@@ -1,0 +1,423 @@
+<!doctype html>
+<html>
+<head>
+<title>Unreviewed labs</title>
+<style>
+  body { font-family: sans-serif; margin: 1em; }
+  a { margin-right: 1em; }
+
+  h2 a { text-decoration: none; color: inherit; }
+  h2 a:hover { text-decoration: underline; }
+  h2 .mrn { font-weight: normal; font-size: 0.8em; color: #666; margin-left: 0.5em; }
+
+  /* The patient's yellow sticky note (editable in place) */
+  .sticky {
+    white-space: pre-wrap;
+    background: #fff9c4;
+    padding: 1em;
+    border-radius: 4px;
+    max-width: 40em;
+  }
+  .sticky[contenteditable] { cursor: text; }
+  .sticky[contenteditable]:focus { outline: 2px solid #f9a825; }
+
+  /* When the yellow sticky was last updated (hover: full PT timestamp) */
+  .sticky-updated { margin: 0 0 0.25em; font-size: 0.9em; color: #666; }
+  .sticky-updated button { font-size: 0.9em; }
+  .sticky-updated button:disabled { opacity: 0.5; }
+
+  /* One line of lab info above each result */
+  .lab-info { margin: 0.5em 0 0; }
+  .lab-info .lab-name { font-weight: bold; }
+  .lab-info .lab-id { color: #999; }
+
+  table.result-table { border-collapse: collapse; margin: 0.25em 0 1em; }
+  .result-table th, .result-table td { text-align: left; padding: 2px 1.5em 2px 0; vertical-align: top; }
+  .result-table th { font-weight: bold; }
+  /* values with a nonempty flag render bold red, except 'N' (normal) */
+  .result-table td.flagged { font-weight: bold; color: #b91c1c; }
+  /* paramNotes can be multi-line preformatted text (e.g. the NIH LDL goals
+     ASCII table): keep the line breaks, monospace so it aligns */
+  .result-table td.notes { white-space: pre-wrap; font-family: monospace; font-size: 1.5em; }
+  pre.result-notes {
+    margin: 0.25em 0 1em;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: inherit;
+    line-height: 1.4;
+  }
+
+  /* Per-patient schedule button and its side panel */
+  h2 .appt-open { font-size: 0.8em; margin-left: 0.5em; }
+  .appt-panel {
+    position: fixed;
+    top: 0;
+    right: 0;
+    height: 100%;
+    width: min(36em, 100vw);
+    background: #fff;
+    border-left: 1px solid #ccc;
+    box-shadow: -4px 0 12px rgba(0, 0, 0, 0.15);
+    padding: 1em;
+    overflow-y: auto;
+    z-index: 10;
+  }
+  .appt-panel h3 { margin-top: 0; }
+  .appt-panel #appt-date { width: 100%; box-sizing: border-box; }
+  /* pill group: the radio hides behind a rounded label */
+  .appt-pills { display: flex; flex-wrap: wrap; gap: 0.4em; margin: 0.25em 0; }
+  .appt-pills .pill input { position: absolute; opacity: 0; pointer-events: none; }
+  .appt-pills .pill span {
+    display: inline-block;
+    padding: 0.15em 0.8em;
+    border: 1px solid #888;
+    border-radius: 999px;
+    cursor: pointer;
+  }
+  .appt-pills .pill.on span { background: #333; color: #fff; border-color: #333; }
+  .appt-panel #appt-reason { width: 100%; box-sizing: border-box; font-size: 2em; }
+  /* Keyword chips, server-side-rendered once (the keywords table never
+     changes): several columns of names, each clickable to insert its note */
+  .appt-keywords { column-count: 3; column-gap: 1.5em; margin: 0.5em 0 0; }
+  .appt-keywords .kw { display: block; break-inside: avoid; cursor: pointer; color: #1a56db; }
+  .appt-keywords .kw:hover { text-decoration: underline; }
+  /* Cancel left, Schedule right, a clear gap below the chips; the buttons
+     sit between the page's default button size and 2x */
+  .appt-actions { display: flex; justify-content: space-between; margin-top: 1.5em; }
+  .appt-actions button { font-size: 1.5em; padding: 0.25em 0.75em; }
+  .appt-panel-status { color: #b91c1c; }
+  /* Green toast, bottom center, shown for 3s after a successful booking */
+  #appt-toast {
+    position: fixed;
+    bottom: 1em;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #16a34a;
+    color: #fff;
+    padding: 0.5em 1em;
+    border-radius: 4px;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+    z-index: 20;
+  }
+</style>
+</head>
+<body>
+  {% set active = "Unreviewed" %}
+  {% include "header_nav.html" %}
+  <h1>Unreviewed labs</h1>
+  {% if patients %}
+  <p>{{ patients|length }} patient(s), {{ lab_count }} lab(s)</p>
+  {% for pt in patients %}
+  <section>
+    <h2>
+      <a href="/patient?mrn={{ pt.mrn }}">{{ pt.name }}{% if pt.suffix %} ({{ pt.suffix }}){% endif %}</a>
+      <span class="mrn">MRN: {{ pt.mrn }}</span>
+      <button class="appt-open" type="button" data-mrn="{{ pt.mrn }}"
+              data-name="{{ pt.name }}{% if pt.suffix %} ({{ pt.suffix }}){% endif %}"
+              title="Book a C reminder appointment for this patient">schedule</button>
+    </h2>
+    <p class="sticky-updated">
+      <span class="sticky-updated-label" data-mrn="{{ pt.mrn }}"
+            {% if pt.sticky_updated_tip %} title="{{ pt.sticky_updated_tip }}"{% endif %}>
+        {% if pt.sticky_updated %}Sticky updated {{ pt.sticky_updated }}{% else %}Sticky age unknown{% endif %}
+      </span>
+      <button class="sticky-refresh" type="button" data-mrn="{{ pt.mrn }}"
+              title="Re-fetch the yellow sticky from ECW and update this section">refresh</button>
+      <button class="sticky-save" type="button" data-mrn="{{ pt.mrn }}"
+              title="Save the edited sticky to ECW. The server checks the sticky against ECW first, so a note that changed since this page loaded is kept." hidden>save</button>
+    </p>
+    <div class="sticky" contenteditable="true" spellcheck="false" data-mrn="{{ pt.mrn }}">{{ pt.sticky }}</div>
+    {% if pt.lab_summary %}
+    <p class="lab-summary">To add: {{ pt.lab_summary }}</p>
+    {% endif %}
+    {% if pt.lab_summary_done %}
+    <p class="lab-summary">{{ pt.lab_summary_done }}</p>
+    {% endif %}
+    {% for lab in pt.labs %}
+    <div class="lab">
+      <p class="lab-info">{{ lab.info | safe }}</p>
+      {{ lab.result | safe }}
+    </div>
+    {% endfor %}
+  </section>
+  {% endfor %}
+  {% else %}
+  <p>No unreviewed labs.</p>
+  {% endif %}
+
+  <div class="appt-panel" id="appt-panel" hidden>
+    <h3 id="appt-heading">Schedule appointment</h3>
+    <p>Type: C reminder</p>
+    <form id="appt-form">
+      <p>
+        <label for="appt-date">Date</label><br>
+        <input type="date" id="appt-date" required>
+      </p>
+      <p>Time</p>
+      <p class="appt-pills">
+        <label class="pill"><input type="radio" name="appt-time" value="07:00 am" checked><span>7:00 am</span></label>
+        <label class="pill"><input type="radio" name="appt-time" value="07:15 am"><span>7:15 am</span></label>
+        <label class="pill"><input type="radio" name="appt-time" value="07:30 am"><span>7:30 am</span></label>
+        <label class="pill"><input type="radio" name="appt-time" value="07:45 am"><span>7:45 am</span></label>
+      </p>
+      <p>
+        <label for="appt-reason">Reason</label><br>
+        <textarea id="appt-reason" rows="8" required></textarea>
+      </p>
+      <p class="appt-keywords" id="appt-keywords">{{ keywords_html | safe }}</p>
+      <p class="appt-actions">
+        <button type="button" id="appt-cancel">Cancel</button>
+        <button type="submit" id="appt-save">Schedule</button>
+      </p>
+      <p class="appt-panel-status" id="appt-status" hidden></p>
+    </form>
+  </div>
+
+  <div id="appt-toast" hidden></div>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+  // One editable yellow sticky per patient. stickyNotes holds the db state
+  // per MRN (from page load/refresh; always a string, '' for an empty
+  // sticky). A section's save button shows when its note's text differs
+  // from stickyNotes; clicking it POSTs /api/patient_note_edit. Refresh
+  // POSTs /api/patient_note. Both take the mrn, like the /patient page.
+  const stickyNotes = {};
+  const stickies = Array.from(document.querySelectorAll('div.sticky'));
+  for (const el of stickies) {
+    stickyNotes[el.dataset.mrn] = el.textContent;
+    el.spellcheck = false;
+    el.addEventListener('input', () => updateStickySave(el.dataset.mrn));
+  }
+
+  function byMrn(mrn, sel) {
+    return document.querySelector(sel + `[data-mrn="${mrn}"]`);
+  }
+
+  function updateStickySave(mrn) {
+    const el = byMrn(mrn, 'div.sticky');
+    const btn = byMrn(mrn, 'button.sticky-save');
+    if (el && btn) btn.hidden = el.innerText === stickyNotes[mrn];
+  }
+
+  function adoptSticky(mrn, note) {
+    stickyNotes[mrn] = note;
+    updateStickySave(mrn);
+  }
+
+  function setStickyAge(mrn, updated, tip) {
+    const label = byMrn(mrn, '.sticky-updated-label');
+    if (!label) return;
+    label.textContent = updated
+      ? `Sticky updated ${updated}`
+      : 'Sticky age unknown';
+    if (tip) label.title = tip; else label.removeAttribute('title');
+  }
+
+  // Refresh re-fetches the sticky from the ECW interface and updates the
+  // note and the "Sticky updated ..." line in place. A refresh replaces
+  // any unsaved edit.
+  for (const btn of document.querySelectorAll('button.sticky-refresh')) {
+    btn.addEventListener('click', async () => {
+      const mrn = btn.dataset.mrn;
+      btn.disabled = true;
+      const label = byMrn(mrn, '.sticky-updated-label');
+      if (label) { label.textContent = 'Refreshing sticky\u2026'; label.removeAttribute('title'); }
+      try {
+        const res = await fetch('/api/patient_note', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mrn: Number(mrn) }),
+        });
+        if (!res.ok) throw new Error(await res.text());
+        const data = await res.json();
+        const el = byMrn(mrn, 'div.sticky');
+        if (el) el.textContent = data.note;
+        adoptSticky(mrn, data.note);
+        setStickyAge(mrn, data.sticky_updated, data.sticky_updated_tip);
+      } catch (err) {
+        if (label) label.textContent = `Sticky refresh failed: ${err.message}`;
+      } finally {
+        btn.disabled = false;
+      }
+    });
+  }
+
+  // Save the edit. On conflict (409) the user's text is kept and the
+  // button stays visible.
+  for (const btn of document.querySelectorAll('button.sticky-save')) {
+    btn.addEventListener('click', async () => {
+      const mrn = btn.dataset.mrn;
+      const el = byMrn(mrn, 'div.sticky');
+      if (!el) return;
+      const original = stickyNotes[mrn];
+      const newNote = el.innerText;
+      btn.disabled = true;
+      btn.textContent = 'saving\u2026';
+      try {
+        const res = await fetch('/api/patient_note_edit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mrn: Number(mrn), original, new: newNote }),
+        });
+        if (!res.ok) throw new Error(await res.text());
+        const data = await res.json();
+        el.textContent = data.note;
+        adoptSticky(mrn, data.note);
+        setStickyAge(mrn, data.sticky_updated, data.sticky_updated_tip);
+      } catch (err) {
+        const label = byMrn(mrn, '.sticky-updated-label');
+        if (label) label.textContent = `Sticky save failed: ${err.message}`;
+        updateStickySave(mrn);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'save';
+      }
+    });
+  }
+
+  // Schedule side panel. One shared panel: a section's schedule button
+  // fills the heading, the date defaults to tomorrow, the time options
+  // are the 15-minute slots db.new_appt books, and the reason defaults
+  // to 'lab'. Schedule closes the panel and POSTs /api/new_appt, which runs
+  // db.new_appt(); a failed save reopens it with the error below.
+  const apptPanel = document.getElementById('appt-panel');
+  const apptHeading = document.getElementById('appt-heading');
+  const apptDate = document.getElementById('appt-date');
+  const apptReason = document.getElementById('appt-reason');
+  const apptSave = document.getElementById('appt-save');
+  const apptStatus = document.getElementById('appt-status');
+  const apptToast = document.getElementById('appt-toast');
+  let apptMrn = null;
+  // Green toast: shown for 3s after a successful booking; a repeat booking
+  // restarts the timer instead of piling up toasts.
+  let toastTimer;
+  function showToast(msg) {
+    apptToast.textContent = msg;
+    apptToast.hidden = false;
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { apptToast.hidden = true; }, 3000);
+  }
+
+  const apptPills = Array.from(document.querySelectorAll('.appt-pills .pill'));
+  function paintApptPills() {
+    for (const pill of apptPills) {
+      pill.classList.toggle('on', pill.querySelector('input').checked);
+    }
+  }
+  for (const pill of apptPills) {
+    pill.querySelector('input').addEventListener('change', paintApptPills);
+  }
+  paintApptPills();
+
+  // Keyword chips below the reason textarea (server-side-rendered once
+  // at startup from the keywords table, which never changes): clicking
+  // one inserts its note at the textarea's cursor, or at the end when
+  // it has none. The insert goes through execCommand('insertText') so
+  // the browser records it in the textarea's native undo stack and
+  // Ctrl+Z undoes it like any typed edit.
+  function insertAtCursor(el, text) {
+    const hasSelection = el.selectionStart != null;
+    el.focus();
+    if (!hasSelection) {
+      // The textarea was never focused: focus() can place the caret at
+      // the start, but we append to the end instead.
+      el.setSelectionRange(el.value.length, el.value.length);
+    }
+    if (!document.execCommand('insertText', false, text)) {
+      // execCommand failed: fall back to a plain value write, which the
+      // undo stack does not track.
+      const start = el.selectionStart ?? el.value.length;
+      const end = el.selectionEnd ?? start;
+      el.value = el.value.slice(0, start) + text + el.value.slice(end);
+      el.setSelectionRange(start + text.length, start + text.length);
+    }
+  }
+  for (const chip of document.querySelectorAll('#appt-keywords .kw')) {
+    chip.addEventListener('click', () => {
+      if (apptPanel.hidden) return;
+      insertAtCursor(apptReason, chip.dataset.note);
+    });
+  }
+
+  // Cancel closes the panel without saving; the entered date/time/reason
+  // are just discarded.
+  document.getElementById('appt-cancel').addEventListener('click', () => {
+    apptPanel.hidden = true;
+    apptMrn = null;
+  });
+
+  // <input type=date> value in the local timezone (YYYY-MM-DD)
+  function tomorrowInputValue() {
+    const d = new Date();
+    d.setDate(d.getDate() + 1);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  }
+
+  for (const btn of document.querySelectorAll('button.appt-open')) {
+    btn.addEventListener('click', () => {
+      apptMrn = btn.dataset.mrn;
+      apptHeading.textContent = `Schedule ${btn.dataset.name}`;
+      apptDate.value = tomorrowInputValue();
+      apptReason.value = 'lab';
+      apptStatus.hidden = true;
+      apptSave.disabled = false;
+      apptSave.textContent = 'Schedule';
+      apptPanel.hidden = false;
+    });
+  }
+
+  document.getElementById('appt-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (apptMrn === null) return;
+    const radio = document.querySelector('input[name="appt-time"]:checked');
+    const d = apptDate.value; // YYYY-MM-DD
+    if (!radio || !d) return;
+    const mrnStr = apptMrn;
+    const [y, mo, da] = d.split('-');
+    const time = radio.value;
+    const reason = apptReason.value.trim();
+    // Close the panel first, then book it; a failure reopens it. The
+    // section's button doubles as the in-progress indicator, since the
+    // panel (and its saving\u2026 label) is closed by then.
+    apptPanel.hidden = true;
+    apptMrn = null;
+    apptSave.disabled = true;
+    apptSave.textContent = 'saving\u2026';
+    const btn = byMrn(mrnStr, 'button.appt-open');
+    if (btn) {
+      btn.textContent = 'saving\u2026';
+      btn.disabled = true;
+    }
+    try {
+      const res = await fetch('/api/new_appt', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mrn: Number(mrnStr), date: `${mo}/${da}/${y}`, time, reason }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      // Booked: mark the section's button until it resets, and toast.
+      if (btn) {
+        btn.textContent = 'scheduled \u2713';
+        btn.disabled = false;
+        setTimeout(() => { btn.textContent = 'schedule'; }, 3000);
+      }
+      showToast('Scheduled \u2713');
+    } catch (err) {
+      if (btn) {
+        btn.textContent = 'schedule';
+        btn.disabled = false;
+      }
+      apptMrn = mrnStr;
+      apptPanel.hidden = false;
+      apptStatus.textContent = `Save failed: ${err.message}`;
+      apptStatus.hidden = false;
+      apptSave.disabled = false;
+      apptSave.textContent = 'Schedule';
+    }
+  });
+});
+</script>
+</body>
+</html>
