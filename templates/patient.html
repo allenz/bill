@@ -1,0 +1,389 @@
+<!doctype html>
+<html>
+<head>
+<title>Patient {{ mrn }}</title>
+<style>
+  body { font-family: sans-serif; margin: 1em; }
+  a { margin-right: 1em; }
+
+  table { border-collapse: collapse; }
+  th, td { text-align: left; padding: 2px 1.5em 2px 0; }
+  th { font-weight: bold; }
+
+  /* The patient's yellow sticky note (editable in place) */
+  #sticky {
+    white-space: pre-wrap;
+    background: #fff9c4;
+    padding: 1em;
+    border-radius: 4px;
+    max-width: 40em;
+  }
+  #sticky[contenteditable] { cursor: text; }
+  #sticky[contenteditable]:focus { outline: 2px solid #f9a825; }
+
+  /* When the yellow sticky was last updated (hover: full PT timestamp) */
+  #stickyUpdated {
+    margin: 0 0 0.25em;
+    font-size: 0.9em;
+    color: #666;
+  }
+
+  /* Refresh button next to the "Sticky updated ..." line */
+  #stickyUpdated button { font-size: 0.9em; }
+  #stickyUpdated button:disabled { opacity: 0.5; }
+
+  .result-link { color: #0b5ed7; cursor: pointer; }
+  .result-link:hover { text-decoration: underline; }
+
+  /* Unreviewed labs (status 0, from a lab source) render bold */
+  #labsTable tr.unreviewed td { font-weight: bold; }
+
+  /* Reviewed/unreviewed button, inline in the Labs heading line so
+     showing/hiding it never moves the table or its checkboxes */
+  #labActions { margin-left: 0.5em; }
+  #labActions button {
+    font-size: 0.7em;
+    line-height: 1;
+    vertical-align: middle;
+  }
+  #labActions button:disabled { opacity: 0.5; }
+
+  /* Checkbox cell: the input covers the whole cell, so the click area is
+     the full row height and the (min-width) column width. */
+  #labsTable td.check { position: relative; padding: 0; min-width: 2.5em; }
+  #labsTable input.lab-check {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    cursor: pointer;
+  }
+
+  /* Popup with the result details for the clicked lab row */
+  #result-modal {
+    position: fixed; inset: 0;
+    background: rgba(0, 0, 0, 0.4);
+    display: none;
+    align-items: center; justify-content: center;
+    z-index: 2000;
+  }
+  #result-modal.open { display: flex; }
+  #result-modal-card {
+    background: #fff; border-radius: 6px;
+    width: min(700px, 90vw); max-height: 80vh;
+    overflow: auto;
+    padding: 1em 1.5em;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  }
+  #result-modal-header { display: flex; justify-content: space-between; align-items: baseline; }
+  #result-modal-title { font-weight: bold; }
+  #result-modal-close { cursor: pointer; font-size: 1.3em; font-weight: bold; }
+  #result-modal-body table { border-collapse: collapse; margin-top: 0.5em; width: 100%; }
+  #result-modal-body th, #result-modal-body td { text-align: left; padding: 3px 1em 3px 0; vertical-align: top; }
+  #result-modal-body thead th { font-weight: bold; }
+  #result-modal-body pre.result-notes {
+    margin: 0.5em 0 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: inherit;
+    line-height: 1.4;
+  }
+  /* values with a nonempty flag render bold red, except 'N' (normal) */
+  #result-modal-body td.flagged { font-weight: bold; color: #b91c1c; }
+</style>
+</head>
+<body>
+  {% set active = "Patient" %}
+  {% include "header_nav.html" %}
+  <h1>{{ name }}{% if name_suffix %} ({{ name_suffix }}){% endif %}</h1>
+  {# Info block: DOB, phones, email, insurance, address, and the MRN at the
+     bottom, one per <br/> line; missing fields are skipped (server-side).
+     The <br/> is literal template markup, so it is not autoescaped (and the
+     items are escaped by {{ }}). #}
+  <p>{% for item in info %}{{ item }}{% if not loop.last %}<br />{% endif %}{% endfor %}</p>
+  <p id="stickyUpdated">
+    <span id="stickyUpdatedLabel"{% if sticky_updated_tip %} title="{{ sticky_updated_tip }}"{% endif %}
+          >{% if sticky_updated %}Sticky updated {{ sticky_updated }}{% else %}Sticky age unknown{% endif %}</span>
+    <button id="stickyRefresh" type="button" title="Re-fetch the yellow sticky from ECW and update this page">refresh</button>
+    <button id="stickySave" type="button" title="Save the edited sticky to ECW. The server checks the sticky against ECW first, so a note that changed since this page loaded is kept." hidden>save</button>
+  </p>
+  {# sticky is never null in the db (empty sticky = ''), so the box is
+     always rendered. #}
+  <div id="sticky" contenteditable="true" spellcheck="false">{{ sticky }}</div>
+  {% if lab_summary %}
+  <p id="labSummary">{{ lab_summary }}</p>
+  {% endif %}
+  <h2>Labs (past 3 months)
+    <span id="labActions" hidden>
+      <button id="labStatusBtn" type="button">mark reviewed</button>
+    </span>
+  </h2>
+  <table id="labsTable">
+    <thead>
+      <tr><th></th><th>name</th><th>!</th><th>date</th><th>collected</th><th>result_date</th><th>lab</th><th>result</th><th>type</th></tr>
+    </thead>
+    <tbody>
+{{ labs_body | safe }}
+    </tbody>
+  </table>
+  <h2>Encounters</h2>
+  <table>
+    <thead>
+      <tr><th>date</th><th>type</th><th>reason</th><th>message</th><th>refills</th></tr>
+    </thead>
+    <tbody>
+{{ body | safe }}
+    </tbody>
+  </table>
+
+  <div id="result-modal">
+    <div id="result-modal-card">
+      <div id="result-modal-header">
+        <span id="result-modal-title"></span>
+        <span id="result-modal-close" title="Close">&times;</span>
+      </div>
+      <div id="result-modal-body"></div>
+    </div>
+  </div>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+  // Popup: result details for the clicked lab row (fetches /api/lab_result).
+  // Clicking the same link again, the x, or Esc closes it.
+  const RESULT_FIELDS = ['itemName', 'value', 'units', 'range', 'flag', 'paramNotes'];
+  const modal = document.getElementById('result-modal');
+  const modalTitle = document.getElementById('result-modal-title');
+  const modalBody = document.getElementById('result-modal-body');
+  let openLab = null;
+
+  function closeResultModal() {
+    openLab = null;
+    modal.classList.remove('open');
+    modalTitle.textContent = '';
+    modalBody.replaceChildren();
+  }
+
+  async function showResultModal(labId, name) {
+    if (openLab === labId) { closeResultModal(); return; }
+    openLab = labId;
+    modal.classList.add('open');
+    modalTitle.textContent = `Results for ${name || labId}`;
+    modalBody.textContent = 'Loading\u2026';
+    try {
+      const res = await fetch(`/api/lab_result?id=${encodeURIComponent(labId)}`);
+      if (!res.ok) throw new Error(await res.text());
+      const results = await res.json();
+      if (results.some((r) => r.notes != null && r.notes !== '')) {
+        // im (imaging) rows: the result is a single notes field holding the
+        // full report text; show it directly instead of the field table.
+        const pre = document.createElement('pre');
+        pre.className = 'result-notes';
+        pre.textContent = results
+          .map((r) => r.notes)
+          .filter((n) => n != null && n !== '')
+          .join('\n\n');
+        modalBody.replaceChildren(pre);
+        return;
+      }
+      const table = document.createElement('table');
+      const thead = document.createElement('thead');
+      const headRow = document.createElement('tr');
+      for (const field of RESULT_FIELDS) {
+        const th = document.createElement('th');
+        th.textContent = field;
+        headRow.append(th);
+      }
+      thead.append(headRow);
+      const tbody = document.createElement('tbody');
+      for (const r of results) {
+        const tr = document.createElement('tr');
+        for (const field of RESULT_FIELDS) {
+          const td = document.createElement('td');
+          td.textContent = r[field] == null ? '' : r[field];
+          const flag = r.flag == null ? '' : String(r.flag).trim();
+          if (field === 'value' && flag && flag !== 'N') {
+            td.className = 'flagged';
+          }
+          tr.append(td);
+        }
+        tbody.append(tr);
+      }
+      table.append(thead, tbody);
+      modalBody.replaceChildren(table);
+    } catch (err) {
+      modalBody.textContent = `Failed to load results: ${err.message}`;
+    }
+  }
+
+  // The yellow sticky is editable in place. stickyNote reflects db state
+  // (from page load/refresh) and is always a string ('' for an empty
+  // sticky). We show the save button if the note's text differs from
+  // stickyNote; clicking it POSTs /api/patient_note_edit.
+  const stickyUpdated = document.getElementById('stickyUpdated');
+  const stickyLabel = document.getElementById('stickyUpdatedLabel');
+  const stickyRefresh = document.getElementById('stickyRefresh');
+  const stickySave = document.getElementById('stickySave');
+  let stickyEl = document.getElementById('sticky');
+  let stickyNote = {{ sticky | tojson }};
+
+  function updateStickySave() {
+    stickySave.hidden = !(stickyEl && stickyEl.innerText !== stickyNote);
+  }
+  function adoptSticky(note) {
+    stickyNote = note;
+    updateStickySave();
+  }
+  function wireSticky(el) {
+    el.spellcheck = false;
+    el.addEventListener('input', updateStickySave);
+  }
+  if (stickyEl) wireSticky(stickyEl);
+  updateStickySave();
+
+  // Refresh the yellow sticky: POST /api/patient_note re-fetches it from the
+  // ECW interface (db.update_patient_note) and the response updates the note
+  // and the "Sticky updated ..." line in place. A refresh replaces any
+  // unsaved edit.
+  if (stickyRefresh) {
+    stickyRefresh.addEventListener('click', async () => {
+      stickyRefresh.disabled = true;
+      stickyLabel.textContent = 'Refreshing sticky\u2026';
+      stickyLabel.removeAttribute('title');
+      try {
+        const res = await fetch('/api/patient_note', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mrn: {{ mrn }} }),
+        });
+        if (!res.ok) throw new Error(await res.text());
+        const data = await res.json();
+        const note = data.note;
+        stickyEl.textContent = note;
+        adoptSticky(note);
+        stickyLabel.textContent = data.sticky_updated
+          ? `Sticky updated ${data.sticky_updated}`
+          : 'Sticky age unknown';
+        if (data.sticky_updated_tip) stickyLabel.title = data.sticky_updated_tip;
+      } catch (err) {
+        stickyLabel.textContent = `Sticky refresh failed: ${err.message}`;
+      } finally {
+        stickyRefresh.disabled = false;
+      }
+    });
+  }
+
+  // Save edit changes. On conflict (409) the user's text is kept and the
+  // button stays visible.
+  if (stickySave) {
+    stickySave.addEventListener('click', async () => {
+      if (!stickyEl) return;
+      const original = stickyNote;
+      const newNote = stickyEl.innerText;
+      stickySave.disabled = true;
+      stickySave.textContent = 'saving\u2026';
+      try {
+        const res = await fetch('/api/patient_note_edit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mrn: {{ mrn }}, original, new: newNote }),
+        });
+        if (!res.ok) throw new Error(await res.text());
+        const data = await res.json();
+        const note = data.note;
+        stickyEl.textContent = note;
+        adoptSticky(note);
+        stickyLabel.textContent = data.sticky_updated
+          ? `Sticky updated ${data.sticky_updated}`
+          : 'Sticky age unknown';
+        if (data.sticky_updated_tip) stickyLabel.title = data.sticky_updated_tip;
+      } catch (err) {
+        stickyLabel.textContent = `Sticky save failed: ${err.message}`;
+        updateStickySave();
+      } finally {
+        stickySave.disabled = false;
+        stickySave.textContent = 'save';
+      }
+    });
+  }
+
+  // Delegated: the rows are static (server-rendered), so one handler on the
+  // table covers every "view" link.
+  const labsTable = document.getElementById('labsTable');
+  labsTable.addEventListener('click', (e) => {
+    const link = e.target.closest('a.result-link');
+    if (link) showResultModal(link.dataset.lab, link.dataset.name);
+  });
+
+  // Reviewed/unreviewed button over the checked lab rows. Any unreviewed lab
+  // among the selection (data-unreviewed, the bold-row rule) offers "mark
+  // reviewed"; a selection that is all reviewed offers "mark unreviewed".
+  const labActions = document.getElementById('labActions');
+  const labStatusBtn = document.getElementById('labStatusBtn');
+
+  function selectedLabs() {
+    const out = [];
+    for (const cb of labsTable.querySelectorAll('input.lab-check')) {
+      if (cb.checked) {
+        out.push({ id: Number(cb.dataset.lab),
+                   unreviewed: cb.dataset.unreviewed === '1' });
+      }
+    }
+    return out;
+  }
+
+  function updateLabActions() {
+    const sel = selectedLabs();
+    if (sel.length === 0) {
+      labActions.hidden = true;
+      return;
+    }
+    labActions.hidden = false;
+    const anyUnreviewed = sel.some((l) => l.unreviewed);
+    labStatusBtn.textContent = anyUnreviewed ? 'mark reviewed' : 'mark unreviewed';
+    // The status to store on the selection: 1 reviewed, 0 unreviewed.
+    labStatusBtn.dataset.status = anyUnreviewed ? '1' : '0';
+  }
+
+  labsTable.addEventListener('change', (e) => {
+    if (e.target.matches('input.lab-check')) updateLabActions();
+  });
+
+  labStatusBtn.addEventListener('click', async () => {
+    const sel = selectedLabs();
+    if (sel.length === 0) return;
+    const status = Number(labStatusBtn.dataset.status);
+    labStatusBtn.disabled = true;
+    try {
+      const res = await fetch('/api/lab_status', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mrn: {{ mrn }},
+          lab_ids: sel.map((l) => l.id),
+          status,
+        }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      // Re-style the rows in place from the server's fresh status: the
+      // unreviewed bold class and each checkbox's data-unreviewed.
+      for (const lab of data.labs) {
+        const cb = labsTable.querySelector(`input.lab-check[data-lab="${lab.id}"]`);
+        if (!cb) continue;
+        cb.dataset.unreviewed = lab.unreviewed ? '1' : '0';
+        cb.closest('tr').classList.toggle('unreviewed', !!lab.unreviewed);
+      }
+      updateLabActions();
+    } catch (err) {
+      alert(`Failed to update labs: ${err.message}`);
+    } finally {
+      labStatusBtn.disabled = false;
+    }
+  });
+  document.getElementById('result-modal-close').addEventListener('click', closeResultModal);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeResultModal(); });
+});
+</script>
+</body>
+</html>

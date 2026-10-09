@@ -1,0 +1,252 @@
+<!doctype html>
+<html>
+<head>
+<title>Lab</title>
+<link rel="stylesheet" href="https://cdn.datatables.net/3.1.3/css/dataTables.dataTables.min.css" crossorigin="anonymous">
+<script src="https://cdn.datatables.net/3.1.3/js/dataTables.min.js" crossorigin="anonymous"></script>
+<link href="https://cdn.datatables.net/fixedheader/5.1.2/css/fixedHeader.dataTables.min.css" rel="stylesheet">
+<script src="https://cdn.datatables.net/fixedheader/5.1.2/js/dataTables.fixedHeader.min.js"></script>
+<style>
+  body { font-family: sans-serif; margin: 1em; }
+  a { margin-right: 1em; }
+
+  /* Hide sort arrows */
+  table.dataTable thead > tr > th.dt-orderable-asc .dt-column-order { display: none; }
+  table.dataTable thead > tr > th { padding-right: 10px !important; }
+
+  .result-link { color: #0b5ed7; cursor: pointer; }
+  .result-link:hover { text-decoration: underline; }
+
+  /* Unreviewed toggle switch */
+  .filters { display: flex; align-items: center; gap: 0.5em; margin: 0.5em 0; }
+  .switch { position: relative; display: inline-block; width: 40px; height: 22px; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch .slider {
+    position: absolute; inset: 0; cursor: pointer;
+    background-color: #ccc; border-radius: 22px; transition: 0.2s;
+  }
+  .switch .slider:before {
+    position: absolute; content: "";
+    height: 16px; width: 16px; left: 3px; bottom: 3px;
+    background-color: white; border-radius: 50%; transition: 0.2s;
+  }
+  .switch input:checked + .slider { background-color: #0b5ed7; }
+  .switch input:checked + .slider:before { transform: translateX(18px); }
+
+  /* Unreviewed labs (status 0) render bold */
+  #labTable tr.unreviewed td { font-weight: bold; }
+
+  /* Popup with the result details for the clicked lab row */
+  #result-modal {
+    position: fixed; inset: 0;
+    background: rgba(0, 0, 0, 0.4);
+    display: none;
+    align-items: center; justify-content: center;
+    z-index: 2000;
+  }
+  #result-modal.open { display: flex; }
+  #result-modal-card {
+    background: #fff; border-radius: 6px;
+    width: min(700px, 90vw); max-height: 80vh;
+    overflow: auto;
+    padding: 1em 1.5em;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  }
+  #result-modal-header { display: flex; justify-content: space-between; align-items: baseline; }
+  #result-modal-title { font-weight: bold; }
+  #result-modal-close { cursor: pointer; font-size: 1.3em; font-weight: bold; }
+  #result-modal-body table { border-collapse: collapse; margin-top: 0.5em; width: 100%; }
+  #result-modal-body th, #result-modal-body td { text-align: left; padding: 3px 1em 3px 0; vertical-align: top; }
+  #result-modal-body thead th { font-weight: bold; }
+  #result-modal-body pre.result-notes {
+    margin: 0.5em 0 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: inherit;
+    line-height: 1.4;
+  }
+  /* values with a nonempty flag render bold red, except 'N' (normal) */
+  #result-modal-body td.flagged { font-weight: bold; color: #b91c1c; }
+</style>
+</head>
+<body>
+  {% set active = "Lab" %}
+  {% include "header_nav.html" %}
+  <h1>Lab</h1>
+  <div class="filters">
+    <label class="switch" title="Show only unreviewed labs (status 0, from a lab source)">
+      <input type="checkbox" id="unreviewed-toggle">
+      <span class="slider"></span>
+    </label>
+    <label for="unreviewed-toggle">Unreviewed</label>
+  </div>
+  <table id="labTable" class="display" style="width:100%">
+    <thead>
+      <tr>{{ header | safe }}</tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <div id="result-modal">
+    <div id="result-modal-card">
+      <div id="result-modal-header">
+        <span id="result-modal-title"></span>
+        <span id="result-modal-close" title="Close">&times;</span>
+      </div>
+      <div id="result-modal-body"></div>
+    </div>
+  </div>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+  // COLUMNS mirrors LAB_COLUMNS in app.py; the API's data rows are keyed by
+  // these names (display text, formatted server-side), plus extra raw fields
+  // (mrn, status_int, from_lab) that the hooks below use.
+  const COLUMNS = {{ columns | tojson }};
+
+  const table = new DataTable('#labTable', {
+    serverSide: true,
+    processing: true, // Shows a "Loading..." indicator
+    fixedHeader: true,
+    pageLength: 100,
+    order: [[COLUMNS.indexOf('result_date'), 'desc']], // newest result first
+    columns: COLUMNS.map((name) => ({ data: name, name })),
+    columnDefs: [{
+      // Patient cell links to the patient page when the row has an MRN.
+      // DataTables inserts a render function's result as HTML; building the
+      // <a> via the DOM keeps the label escaped.
+      targets: COLUMNS.indexOf('Patient'),
+      render: function(name, type, full) {
+        if (type === 'sort' || type === 'filter') return name;
+        if (full.mrn == null) return name;
+        const a = document.createElement('a');
+        a.href = `/patient?mrn=${full.mrn}`;
+        a.textContent = name;
+        return a.outerHTML;
+      }
+    }, {
+      // Result received (stored, or at the interface): link that pops up
+      // the result details. fetched (full.result_fetched) tells the modal
+      // whether the result still needs pulling from the lab interface.
+      targets: COLUMNS.indexOf('result'),
+      render: function(text, type, full) {
+        if (!text || type === 'sort' || type === 'filter') return text;
+        const a = document.createElement('a');
+        a.className = 'result-link';
+        a.dataset.lab = full.id;
+        a.dataset.name = full.name;
+        a.dataset.fetched = full.result_fetched;
+        a.textContent = text;
+        return a.outerHTML;
+      }
+    }],
+    // Fires after the row's cells are populated. Unreviewed labs (status 0
+    // from a lab source) render bold; a NULL from_lab counts as unreviewed.
+    // Keep in sync with LAB_FILTERS["unreviewed"] in app.py. status_int is
+    // the raw int status — the display "status" column is interface_status.
+    createdRow: (tr, data) => {
+      if (data.status_int === 0 && data.from_lab !== 0) {
+        tr.classList.add('unreviewed');
+      }
+    },
+    ajax: {
+      url: '/api/lab',
+      type: 'GET',
+      // Send the unreviewed filter with every request.
+      data: (d) => {
+        d.unreviewed = document.getElementById('unreviewed-toggle').checked ? '1' : '';
+      },
+    },
+  });
+
+  document.getElementById('unreviewed-toggle').addEventListener('change',
+    () => table.ajax.reload(() => {}, true));
+
+  // Popup: result details for the clicked lab row (fetches /api/lab_result).
+  // Clicking the same link again, the x, or Esc closes it.
+  const RESULT_FIELDS = ['itemName', 'value', 'units', 'range', 'flag', 'paramNotes'];
+  const modal = document.getElementById('result-modal');
+  const modalTitle = document.getElementById('result-modal-title');
+  const modalBody = document.getElementById('result-modal-body');
+  let openLab = null;
+
+  function closeResultModal() {
+    openLab = null;
+    modal.classList.remove('open');
+    modalTitle.textContent = '';
+    modalBody.replaceChildren();
+  }
+
+  // fetched is "1" when the result is stored (plain load) and "0" when it
+  // has only been received at the interface and must be pulled from the lab
+  // interface first (slower: the process may re-login to ECW on first use).
+  async function showResultModal(labId, name, fetched) {
+    if (openLab === labId) { closeResultModal(); return; }
+    openLab = labId;
+    modal.classList.add('open');
+    modalTitle.textContent = `Results for ${name || labId}`;
+    modalBody.textContent = fetched === '0'
+      ? 'Fetching from lab interface\u2026 (may take a minute)'
+      : 'Loading\u2026';
+    try {
+      const res = await fetch(`/api/lab_result?id=${encodeURIComponent(labId)}`);
+      if (res.status === 409) {
+        // The interface had no reports for this lab yet.
+        modalBody.textContent = 'No result available yet';
+        return;
+      }
+      if (!res.ok) throw new Error(await res.text());
+      const results = await res.json();
+      if (results.some((r) => r.notes != null && r.notes !== '')) {
+        // im (imaging) rows: the result is a single notes field holding the
+        // full report text; show it directly instead of the field table.
+        const pre = document.createElement('pre');
+        pre.className = 'result-notes';
+        pre.textContent = results
+          .map((r) => r.notes)
+          .filter((n) => n != null && n !== '')
+          .join('\n\n');
+        modalBody.replaceChildren(pre);
+        return;
+      }
+      const table = document.createElement('table');
+      const thead = document.createElement('thead');
+      const headRow = document.createElement('tr');
+      for (const field of RESULT_FIELDS) {
+        const th = document.createElement('th');
+        th.textContent = field;
+        headRow.append(th);
+      }
+      thead.append(headRow);
+      const tbody = document.createElement('tbody');
+      for (const r of results) {
+        const tr = document.createElement('tr');
+        for (const field of RESULT_FIELDS) {
+          const td = document.createElement('td');
+          td.textContent = r[field] == null ? '' : r[field];
+          const flag = r.flag == null ? '' : String(r.flag).trim();
+          if (field === 'value' && flag && flag !== 'N') {
+            td.className = 'flagged';
+          }
+          tr.append(td);
+        }
+        tbody.append(tr);
+      }
+      table.append(thead, tbody);
+      modalBody.replaceChildren(table);
+    } catch (err) {
+      modalBody.textContent = `Failed to load results: ${err.message}`;
+    }
+  }
+
+  // Delegated: DataTables redraws the body on sort/page, the table element persists.
+  document.getElementById('labTable').addEventListener('click', (e) => {
+    const link = e.target.closest('a.result-link');
+    if (link) showResultModal(link.dataset.lab, link.dataset.name, link.dataset.fetched);
+  });
+  document.getElementById('result-modal-close').addEventListener('click', closeResultModal);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeResultModal(); });
+});
+</script>
+</body>
+</html>

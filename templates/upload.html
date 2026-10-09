@@ -1,0 +1,131 @@
+<!doctype html>
+<html>
+<head>
+<title>Upload</title>
+<style>
+  body { font-family: sans-serif; margin: 1em; }
+  a { margin-right: 1em; }
+
+  #drop {
+    border: 2px dashed #888;
+    border-radius: 6px;
+    padding: 2em 1em;
+    text-align: center;
+    margin: 1em 0;
+    color: #555;
+  }
+  #drop.over { border-color: #0b5ed7; background: #eef4ff; color: #0b5ed7; }
+  #drop input { margin-top: 0.5em; }
+
+  #status { min-height: 1.4em; margin: 0.5em 0; }
+  #status.ok { color: #0a7a2f; }
+  #status.error { color: #b00020; }
+
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 4px 1em 4px 0; vertical-align: top; }
+  thead th { font-weight: bold; border-bottom: 1px solid #ccc; }
+  td.name { max-width: 40em; overflow-wrap: anywhere; }
+  td.size, td.mtime { white-space: nowrap; }
+</style>
+</head>
+<body>
+  {% set active = "Upload" %}
+  {% include "header_nav.html" %}
+  <h1>Upload</h1>
+
+  <div id="drop">
+    Drag files here, or
+    <input type="file" id="file" multiple>
+    to choose.
+  </div>
+  <p id="status"></p>
+
+  <table id="fileTable">
+    <thead>
+      <tr><th>Name</th><th>Size</th><th>Uploaded</th></tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+  const drop = document.getElementById('drop');
+  const input = document.getElementById('file');
+  const status = document.getElementById('status');
+  const tbody = document.querySelector('#fileTable tbody');
+
+  function formatSize(n) {
+    if (n < 1024) return `${n} B`;
+    const units = ['KB', 'MB', 'GB', 'TB'];
+    let v = n, i = -1;
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    return `${v.toFixed(v < 10 ? 1 : 0)} ${units[i]}`;
+  }
+
+  function formatTime(iso) {
+    const d = new Date(iso);
+    if (isNaN(d)) return iso;
+    return d.toLocaleString();
+  }
+
+  async function loadFiles() {
+    try {
+      const res = await fetch('/api/uploads');
+      if (!res.ok) throw new Error(await res.text());
+      const files = await res.json();
+      tbody.replaceChildren();
+      for (const f of files) {
+        const tr = document.createElement('tr');
+        const tdName = document.createElement('td');
+        tdName.className = 'name';
+        tdName.textContent = f.name;
+        const tdSize = document.createElement('td');
+        tdSize.className = 'size';
+        tdSize.textContent = formatSize(f.size);
+        const tdTime = document.createElement('td');
+        tdTime.className = 'mtime';
+        tdTime.textContent = formatTime(f.mtime);
+        tr.append(tdName, tdSize, tdTime);
+        tbody.append(tr);
+      }
+    } catch (err) {
+      status.className = 'error';
+      status.textContent = `Failed to load file list: ${err.message}`;
+    }
+  }
+
+  async function upload(fileList) {
+    if (!fileList.length) return;
+    const form = new FormData();
+    for (const f of fileList) form.append('files', f);
+    status.className = '';
+    status.textContent = `Uploading ${fileList.length} file${fileList.length > 1 ? 's' : ''}\u2026`;
+    try {
+      const res = await fetch('/upload', { method: 'POST', body: form });
+      const text = await res.text();
+      if (!res.ok) throw new Error(text);
+      status.className = 'ok';
+      status.textContent = `Uploaded ${fileList.length} file${fileList.length > 1 ? 's' : ''}.`;
+      input.value = '';
+      loadFiles();
+    } catch (err) {
+      status.className = 'error';
+      status.textContent = `Upload failed: ${err.message}`;
+    }
+  }
+
+  input.addEventListener('change', () => upload([...input.files]));
+
+  drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('over'); });
+  drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+  drop.addEventListener('drop', (e) => {
+    e.preventDefault();
+    drop.classList.remove('over');
+    upload([...e.dataTransfer.files]);
+  });
+
+  loadFiles();
+});
+</script>
+</body>
+</html>
