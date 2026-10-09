@@ -1,0 +1,16 @@
+{# Header navigation linking to the four pages on the "/" route, with
+   the logout link right-aligned. Page templates include this from their
+   body; set `active` to the current page name
+   (e.g. `{% set active = "Messages" %}`) to highlight it. #}
+<style>
+  .header-nav { display: flex; align-items: baseline; }
+  .header-nav a { margin-right: 1em; }
+  .header-nav a.active { font-weight: bold; }
+  .header-nav .nav-logout { margin-left: auto; }
+</style>
+<nav class="header-nav">
+  {% for name, href in [("Report", "/report"), ("Encounter", "/encounter"), ("Lab", "/lab"), ("Upload", "/upload"), ("PayClaim", "/payclaim"), ("Payment", "/payment"), ("Messages", "/messages")] %}
+  <a href="{{ href }}"{% if active == name %} class="active"{% endif %}>{{ name }}</a>
+  {% endfor %}
+  <a class="nav-logout" href="/logout">Logout</a>
+</nav>

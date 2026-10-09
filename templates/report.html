@@ -1,0 +1,366 @@
+<!doctype html>
+<html>
+<head>
+<title>Report</title>
+<link rel="stylesheet" href="https://cdn.datatables.net/3.1.3/css/dataTables.dataTables.min.css" crossorigin="anonymous">
+<script src="https://cdn.datatables.net/3.1.3/js/dataTables.min.js" crossorigin="anonymous"></script>
+<link href="https://cdn.datatables.net/fixedheader/5.1.2/css/fixedHeader.dataTables.min.css" rel="stylesheet">
+<script src="https://cdn.datatables.net/fixedheader/5.1.2/js/dataTables.fixedHeader.min.js"></script>
+<style>
+  body { font-family: sans-serif; margin: 1em; }
+  a { margin-right: 1em; }
+  .topbar { display: flex; justify-content: space-between; align-items: baseline; }
+  .topbar-right { display: flex; align-items: baseline; gap: 1em; }
+  #online-users { font-weight: bold; }
+  #ws-warning { color: #b00020; font-weight: bold; }
+  td.num { text-align: right; }
+
+  /* Hide sort arrows */
+  table.dataTable thead > tr > th.dt-orderable-asc .dt-column-order { display: none; }
+  table.dataTable thead > tr > th { padding-right: 10px !important; }
+
+  .editable-input {
+    width: 120px;
+    padding: 4px 8px;
+    border: 1px solid #ccc;
+    border-radius: 4px;
+    transition: background-color 0.3s ease;
+  }
+  .editable-input[data-field="due_date"],
+  .editable-input[data-field="assignee"] { width: 60px; }
+  .editable-input[data-field="task"] { width: 80px; }
+  .editable-input[data-field="notes"] { width: 240px; }
+  .save-success { background-color: #d4edda !important; border-color: #28a745 !important; }
+  .save-error { background-color: #f8d7da !important; border-color: #dc3545 !important; }
+  /* Invalid due_date edit: marked red and never saved. */
+  .invalid-date { background-color: #f8d7da !important; border-color: #dc3545 !important; color: #721c24; }
+  .editable-input:disabled { background-color: #f0f0f0; color: #999; cursor: not-allowed; }
+
+  .claim-link { color: #0b5ed7; cursor: pointer; }
+
+  /* PPO toggle switch */
+  .filters { display: flex; align-items: center; gap: 0.5em; margin: 0.5em 0; }
+  .switch { position: relative; display: inline-block; width: 40px; height: 22px; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch .slider {
+    position: absolute; inset: 0; cursor: pointer;
+    background-color: #ccc; border-radius: 22px; transition: 0.2s;
+  }
+  .switch .slider:before {
+    position: absolute; content: "";
+    height: 16px; width: 16px; left: 3px; bottom: 3px;
+    background-color: white; border-radius: 50%; transition: 0.2s;
+  }
+  .switch input:checked + .slider { background-color: #0b5ed7; }
+  .switch input:checked + .slider:before { transform: translateX(18px); }
+  .claim-link:hover { text-decoration: underline; }
+
+  /* Bottom pane with claim_info.py details for the clicked claim number */
+  #claim-pane {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    max-height: 45vh;
+    overflow: auto;
+    background: #fff;
+    border-top: 2px solid #333;
+    box-shadow: 0 -2px 8px rgba(0, 0, 0, 0.25);
+    padding: 0.75em 2em 1.25em;
+    z-index: 2000;
+    display: none;
+  }
+  #claim-pane.open { display: block; }
+  #claim-pane-header { display: flex; justify-content: space-between; align-items: baseline; }
+  #claim-pane-title { font-weight: bold; }
+  #claim-pane-close { cursor: pointer; font-size: 1.3em; font-weight: bold; }
+  #claim-pane-body table { border-collapse: collapse; margin-top: 0.5em; }
+  #claim-pane-body th { text-align: left; padding: 2px 1em 2px 0; vertical-align: top; font-weight: normal; }
+  #claim-pane-body td { padding: 2px 0; }
+</style>
+</head>
+<body>
+  {% set active = "Report" %}
+  {% include "header_nav.html" %}
+  <div class="topbar">
+    <h1>Report</h1>
+    <div class="topbar-right">
+      <span id="online-users">Online:</span>
+      <span id="ws-warning"></span>
+    </div>
+  </div>
+  <p>
+    <a href="/report">Past 3 months</a>
+    <a href="/report?months=5">Past 5 months</a>
+    <a href="/report?months=12">YTD</a>
+  </p>
+  <div class="filters">
+    <label class="switch" title="Show only rows where ppo = 1">
+      <input type="checkbox" id="ppo-toggle">
+      <span class="slider"></span>
+    </label>
+    <label for="ppo-toggle">PPO</label>
+  </div>
+  <table id="reportsTable" class="display" style="width:100%">
+    <thead>
+      <tr>{{ header | safe }}</tr>
+    </thead>
+    <tbody>
+{{ body | safe }}
+    </tbody>
+  </table>
+
+  <div id="claim-pane">
+    <div id="claim-pane-header">
+      <span id="claim-pane-title"></span>
+      <span id="claim-pane-close" title="Close">&times;</span>
+    </div>
+    <div id="claim-pane-body"></div>
+  </div>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+  const table = new DataTable('#reportsTable', {
+    pageLength: -1,
+    order: [],
+    fixedHeader: true,
+    columnDefs: [{
+      targets: [0, 1, 2, 3],
+      render: function(data, type, row, meta) {
+        // Sort by the input's current value
+        if (type === 'sort' || type === 'filter') {
+          const match = data.match(/value="([^"]*)"/);
+          return match ? match[1] : data;
+        }
+        return data;
+      }
+    }, {
+      targets: 5,
+      render: function(data, type, row, meta) {
+        if (!data) return data;
+        if (type == 'sort') {
+          const [month, day] = data.split('/');
+          return `${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+        }
+        return data;
+      }
+    }]
+  });
+
+  // PPO toggle: when on, only show rows with ppo = 1. Column 10 is "ppo" —
+  // keep in sync with REPORT_COLUMNS in report.py. ppo is only 0/1/empty,
+  // so a plain column search for "1" is exact.
+  const ppoToggle = document.getElementById('ppo-toggle');
+  ppoToggle.addEventListener('change', () => {
+    table.column(10).search(ppoToggle.checked ? '1' : '', false, false).draw();
+  });
+
+  // due_date is stored as yyyy-mm-dd but shown/edited as mm/dd. We assume
+  // the edited due_date is within a year in the future: use this year if
+  // mm/dd falls on or after today, otherwise next year.
+  function dueDateYear(month, day) {
+    const now = new Date();
+    const thisYear = now.getFullYear();
+    const today = new Date(thisYear, now.getMonth(), now.getDate());
+    const candidate = new Date(thisYear, month - 1, day);
+    return String(candidate >= today ? thisYear : thisYear + 1);
+  }
+
+  // Validate "m/d" or "mm/dd"; returns zero-padded "MM/DD" or null if invalid.
+  function normalizeDueDate(input, v) {
+    const m = /^(\d{1,2})[/](\d{1,2})$/.exec(v.trim());
+    if (!m) return null;
+    const month = +m[1], day = +m[2];
+    const year = +dueDateYear(month, day);
+    const d = new Date(year, month - 1, day);
+    if (d.getFullYear() !== year || d.getMonth() !== month - 1 || d.getDate() !== day) return null;
+    return `${String(month).padStart(2, "0")}/${String(day).padStart(2, "0")}`;
+  }
+
+  // Autosave on change (blur / enter)
+  const tbody = document.querySelector('#reportsTable tbody');
+  if (tbody) {
+    // Clear the red mark as soon as an invalid date is fixed, before saving.
+    tbody.addEventListener('input', (e) => {
+      const input = e.target;
+      if (!input || !input.classList.contains('invalid-date')) return;
+      if (input.value.trim() === '' || normalizeDueDate(input, input.value) !== null) {
+        input.classList.remove('invalid-date');
+      }
+    });
+
+    tbody.addEventListener('change', (e) => {
+      if (e.target && e.target.classList.contains('editable-input')) {
+        const input = e.target;
+        const encounter = input.dataset.encounter;
+        const field = input.dataset.field;
+        let value = input.value;
+        const payload = { encounter: encounter, field: field, value: value };
+
+        if (field === 'due_date') {
+          if (value.trim() === '') {
+            // Clearing the due date is allowed.
+            input.classList.remove('invalid-date');
+          } else {
+            const norm = normalizeDueDate(input, value);
+            if (norm === null) {
+              // Mark red and don't save; the typed text stays so it can be fixed.
+              input.classList.add('invalid-date');
+              return;
+            }
+            input.classList.remove('invalid-date');
+            input.value = norm;
+            const [mm, dd] = norm.split('/').map(Number);
+            // The input shows MM/DD, but the value we send (and what is
+            // stored) is the raw ISO yyyy-mm-dd.
+            payload.value = `${dueDateYear(mm, dd)}-${norm.replace('/', '-')}`;
+          }
+        }
+
+        fetch('/api/update', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        })
+        .then(response => {
+          if (!response.ok) throw new Error('Save failed');
+          return response.json();
+        })
+        .then(() => {
+          // Flash green
+          input.classList.add('save-success');
+          if (field === 'due_date') input.dataset.iso = payload.value;
+          setTimeout(() => input.classList.remove('save-success'), 1200);
+        })
+        .catch(() => {
+          // Flash red
+          input.classList.add('save-error');
+          if (field === 'due_date') input.classList.add('invalid-date');
+          alert('Failed to save update.');
+        });
+      }
+    });
+  }
+});
+
+// Apply a cell_update broadcast: refresh every input for that encounter+field
+// (one encounter can span multiple report rows, one per cpt). due_date values
+// arrive as the raw ISO yyyy-mm-dd and are converted to the mm/dd display
+// here. Never clobber a cell the user is currently editing, and skip inputs
+// that already hold the value (the editor's own tab, which autosaved it).
+function applyCellUpdate(msg) {
+  const display = (msg.field === 'due_date' && msg.value)
+    ? msg.value.slice(5).replace('-', '/')
+    : msg.value;
+  document.querySelectorAll('.editable-input').forEach((input) => {
+    if (input.dataset.encounter === String(msg.encounter)
+        && input.dataset.field === msg.field
+        && document.activeElement !== input
+        && input.value !== display) {
+      input.value = display;
+      if (msg.field === 'due_date') input.dataset.iso = msg.value;
+      input.classList.remove('invalid-date');
+    }
+  });
+}
+
+// The server pushes JSON messages on the /ws/report socket:
+//   {"type": "online", "viewers": ["alice", "alice", "bob"]}
+//   {"type": "cell_update", "encounter": N, "field": "notes", "value": "..."}
+const onlineEl = document.getElementById('online-users');
+const wsWarningEl = document.getElementById('ws-warning');
+const wsProto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+// Show a visible warning (and log) when the server sends something the
+// client doesn't recognize — usually a server/client version mismatch.
+function warnUnexpectedMessage(msg) {
+  console.warn("Unexpected websocket message:", msg);
+  wsWarningEl.textContent = "Unexpected message from server";
+}
+// While the browser is offline, lock the editable cells so edits can only
+// happen while connected.
+function setInputsLocked(locked) {
+  document.querySelectorAll('.editable-input').forEach((input) => {
+    input.disabled = locked;
+  });
+}
+setInputsLocked(!navigator.onLine);
+window.addEventListener('offline', () => setInputsLocked(true));
+window.addEventListener('online', () => setInputsLocked(false));
+
+// The websocket reconnects whenever it drops, so the online list above is
+// restored as soon as connectivity returns.
+function connectOnlineSocket() {
+  const sock = new WebSocket(wsProto + '//' + window.location.host + '/ws/report');
+  sock.onopen = () => { onlineEl.textContent = 'Online: (connecting)'; };
+  sock.onmessage = (event) => {
+    let msg;
+    try {
+      msg = JSON.parse(event.data);
+    } catch {
+      warnUnexpectedMessage(`non-JSON payload: ${event.data}`);
+      return;
+    }
+    if (msg.type === "cell_update") {
+      applyCellUpdate(msg);
+    } else if (msg.type === "online") {
+      onlineEl.textContent = `Online: ${msg.viewers.join(", ")}`;
+    } else {
+      warnUnexpectedMessage(msg);
+    }
+  };
+  sock.onclose = () => {
+    onlineEl.textContent = 'Online: (disconnected)';
+    setTimeout(connectOnlineSocket, 2000);  // keep trying to reconnect
+  };
+}
+connectOnlineSocket();
+
+// Bottom pane: claim_info.py details for the clicked claim number.
+// Clicking the same claim again, the x, or Esc closes it.
+const claimPane = document.getElementById('claim-pane');
+const claimPaneTitle = document.getElementById('claim-pane-title');
+const claimPaneBody = document.getElementById('claim-pane-body');
+let openClaim = null;
+
+function closeClaimPane() {
+  openClaim = null;
+  claimPane.classList.remove('open');
+  claimPaneTitle.textContent = '';
+  claimPaneBody.replaceChildren();
+}
+
+async function showClaimPane(claim) {
+  if (openClaim === claim) { closeClaimPane(); return; }
+  openClaim = claim;
+  claimPane.classList.add('open');
+  claimPaneTitle.textContent = `Claim ${claim}`;
+  claimPaneBody.textContent = 'Loading…';
+  try {
+    const res = await fetch(`/api/claim_info?claim=${claim}`);
+    if (!res.ok) throw new Error(await res.text());
+    const info = await res.json();
+    const table = document.createElement('table');
+    for (const [key, value] of Object.entries(info)) {
+      const tr = document.createElement('tr');
+      const th = document.createElement('th');
+      th.textContent = key;
+      const td = document.createElement('td');
+      td.textContent = value == null ? '' : value;
+      tr.append(th, td);
+      table.append(tr);
+    }
+    claimPaneBody.replaceChildren(table);
+  } catch (err) {
+    claimPaneBody.textContent = `Failed to load claim info: ${err.message}`;
+  }
+}
+
+document.getElementById('reportsTable').addEventListener('click', (e) => {
+  const link = e.target.closest('a.claim-link');
+  if (link) showClaimPane(link.dataset.claim);
+});
+document.getElementById('claim-pane-close').addEventListener('click', closeClaimPane);
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeClaimPane(); });
+</script>
+</body>
+</html>
