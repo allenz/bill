@@ -6,16 +6,16 @@ import html
 import json
 import os
 import re
-import sqlite3
+import psycopg2
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
-import aiosqlite
 from dotenv import load_dotenv
 from quart import Quart, abort, request, Response, jsonify, redirect, render_template, session, websocket
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
+from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.request_validator import RequestValidator
@@ -23,8 +23,9 @@ from twilio.request_validator import RequestValidator
 from werkzeug.utils import secure_filename
 
 from claim_info import claim_info
+from config import DATABASE_URL_ASYNC, PG_DSN
 from models import Message
-from report import render_reports, EDITABLE_COLUMNS, DB_PATH, parse_due_date, format_date
+from report import render_reports, EDITABLE_COLUMNS, parse_due_date, format_date
 
 load_dotenv()
 
@@ -59,6 +60,13 @@ def _format_priority(val):
     if val is None or val == "0":
         return ""
     return "!" if val == "1" else str(val)
+
+
+def _fmt_float(v: float) -> str:
+    """Display a stored float the way the old SQLite db did: values that are
+    integral render without a trailing .0 (SQLite stored those as INTEGER)."""
+    s = f"{v:.10f}".rstrip("0").rstrip(".")
+    return s if s else "0"
 
 
 # All columns of the Lab table, in display order. "collected" is the
@@ -101,8 +109,7 @@ async def log_client_ip(response):
 # table columns in display order).
 app.json.sort_keys = False
 
-db_path = f"sqlite+aiosqlite:///{DB_PATH}"
-engine = create_async_engine(db_path, echo=True, future=True)
+engine = create_async_engine(DATABASE_URL_ASYNC, echo=True)
 async_session = async_sessionmaker(
     engine, class_=AsyncSession, expire_on_commit=False
 )
@@ -204,14 +211,15 @@ async def lab():
     if not session.get("logged_in"):
         return redirect("/login")
 
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
-        cur = await conn.execute("SELECT * FROM lab ORDER BY result_date DESC")
-        rows = await cur.fetchall()
+    async with engine.connect() as conn:
+        rows = (await conn.execute(
+            sa_text("SELECT * FROM lab ORDER BY result_date DESC NULLS LAST")
+        )).fetchall()
 
     header = "".join(f"<th>{html.escape(c)}</th>" for c in LAB_COLUMNS)
     body_rows = []
     for row in rows:
+        row = row._mapping
         # Unreviewed labs (status 0) render bold. NULL status is legacy
         # (pre-status rows, all scraped from the Reviewed tab) and not bolded.
         tr_cls = ' class="unreviewed"' if row["status"] == 0 and row["from_lab_id"] != 0 else ""
@@ -278,21 +286,23 @@ async def payclaim_page():
     if not session.get("logged_in"):
         return redirect("/login")
 
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
-        cur = await conn.execute(
-            "SELECT * FROM pay_claim ORDER BY payment DESC LIMIT :limit",
+    async with engine.connect() as conn:
+        rows = (await conn.execute(
+            sa_text("SELECT * FROM pay_claim ORDER BY payment DESC NULLS LAST LIMIT :limit"),
             {"limit": PAYCLAIM_LIMIT},
-        )
-        rows = await cur.fetchall()
+        )).fetchall()
 
     body_rows = []
     for row in rows:
+        row = row._mapping
         tds = []
         for col in PAYCLAIM_COLUMNS:
             val = row[col]
-            text = "" if val is None else str(val)
-            tds.append(f"<td>{html.escape(text)}</td>")
+            if col in ("paid", "allowed", "adjustment", "deduct") and isinstance(val, float):
+                text_ = _fmt_float(val)
+            else:
+                text_ = "" if val is None else str(val)
+            tds.append(f"<td>{html.escape(text_)}</td>")
         body_rows.append("      <tr>" + "".join(tds) + "</tr>")
 
     header = "".join(f"<th>{html.escape(c)}</th>" for c in PAYCLAIM_COLUMNS)
@@ -310,13 +320,13 @@ PAY_COLUMNS = [
 PAY_NUMERIC_COLUMNS = ("paid",)
 
 # ORDER BY expressions for server-side sorting on /api/payment. paid is
-# stored as NUMERIC with mixed integer/real values, so it must be cast to
-# sort numerically; every other column sorts as-is (dates are ISO text,
+# stored as a float; every other column sorts as-is (dates are ISO text,
 # so text order == chronological order).
-PAYMENT_ORDER_BY = {"paid": "CAST(paid AS REAL)"}
+PAYMENT_ORDER_BY = {"paid": "paid"}
 
 # Order used when the client sends no valid sort: newest first.
-PAYMENT_DEFAULT_ORDER = "payment DESC"
+# NULLS LAST matches the old SQLite ordering (NULLs sort as smallest).
+PAYMENT_DEFAULT_ORDER = "payment DESC NULLS LAST"
 
 # The /payment client requests this many rows per page...
 PAYMENT_PAGE_LENGTH = 100
@@ -336,14 +346,13 @@ async def payment_page():
         return redirect("/login")
 
     # Most common paid amounts, for the filter's datalist.
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
-        cur = await conn.execute(
-            "SELECT paid FROM pay WHERE paid IS NOT NULL GROUP BY paid "
-            "ORDER BY COUNT(*) DESC LIMIT :limit",
+    async with engine.connect() as conn:
+        rows = (await conn.execute(
+            sa_text("SELECT paid FROM pay WHERE paid IS NOT NULL GROUP BY paid "
+                 "ORDER BY COUNT(*) DESC LIMIT :limit"),
             {"limit": PAYMENT_PAID_VALUES_LIMIT},
-        )
-        paid_values = [str(v) for (v,) in await cur.fetchall()]
+        )).fetchall()
+        paid_values = [_fmt_float(v) for (v,) in rows]
 
     header = "".join(f"<th>{html.escape(c)}</th>" for c in PAY_COLUMNS)
     return await render_template(
@@ -359,7 +368,7 @@ async def api_payment():
 
     Like /api/encounter, plus an optional paid= query param: when set, only
     rows whose paid amount numerically equals it are served and counted
-    (the cast means stored integer 20 and real 20.0 both match). Unparseable
+    (paid is stored as a float, so 20 and 20.0 both match). Unparseable
     values are ignored and the table is served unfiltered.
     """
     if not session.get("logged_in"):
@@ -369,7 +378,7 @@ async def api_payment():
     paid = (request.args.get("paid") or "").strip()
     if paid:
         try:
-            where = "CAST(paid AS REAL) = :paid"
+            where = "paid = :paid"
             where_args = {"paid": float(paid)}
         except ValueError:
             # Unparseable: clear both, so a half-set where clause can never
@@ -382,6 +391,7 @@ async def api_payment():
         max_page_length=PAYMENT_MAX_PAGE_LENGTH,
         order_by=PAYMENT_ORDER_BY,
         default_order=PAYMENT_DEFAULT_ORDER,
+        cell=_pay_cell,
         where=where,
         where_args=where_args,
     ))
@@ -402,12 +412,14 @@ ENCOUNTER_COLUMN_LABELS = {"due_date": "due"}
 ENCOUNTER_NUMERIC_COLUMNS = ("billed", "paid", "balance")
 
 # ORDER BY expressions for server-side sorting. The amount columns are stored
-# as text, so they must be cast to sort numerically; every other column sorts
-# as-is (dates are ISO text, so text order == chronological order).
+# as text; NULLIF turns the legacy empty strings into NULL so the cast cannot
+# fail, and NULLS FIRST/LAST (added in _data_table_order_sql) keeps the old
+# SQLite ordering where '' sorted like 0. Every other column sorts as-is
+# (dates are ISO text, so text order == chronological order).
 ENCOUNTER_ORDER_BY = {
-    "billed": "CAST(billed AS REAL)",
-    "paid": "CAST(paid AS REAL)",
-    "balance": "CAST(balance AS REAL)",
+    "billed": "CAST(NULLIF(billed, '') AS DOUBLE PRECISION)",
+    "paid": "CAST(NULLIF(paid, '') AS DOUBLE PRECISION)",
+    "balance": "CAST(NULLIF(balance, '') AS DOUBLE PRECISION)",
 }
 
 # Order used when the client sends no valid sort: newest first.
@@ -444,7 +456,10 @@ def _data_table_order_sql(columns, order_by, default_order):
         except (ValueError, IndexError):
             name = None
         if name is not None and direction in ("asc", "desc"):
-            order_sql.append(f"{order_by.get(name, name)} {direction.upper()}")
+            # SQLite sorts NULLs first in ASC and last in DESC; PostgreSQL
+            # defaults to the opposite, so make it explicit.
+            nulls = "NULLS FIRST" if direction == "asc" else "NULLS LAST"
+            order_sql.append(f"{order_by.get(name, name)} {direction.upper()} {nulls}")
         i += 1
     return order_sql or [default_order]
 
@@ -453,6 +468,18 @@ def _plain_cell(row, col):
     """Display text for a plain cell: None renders as the empty string."""
     val = row[col]
     return "" if val is None else str(val)
+
+
+def _pay_cell(row, col):
+    """Display text for one pay cell: paid floats render without a trailing
+    .0 (matching the old SQLite integer storage), deleted bools render as
+    1/0 (matching the old SQLite integer booleans)."""
+    val = row[col]
+    if col == "paid" and isinstance(val, float):
+        return _fmt_float(val)
+    if col == "deleted":
+        return "" if val is None else ("1" if val else "0")
+    return _plain_cell(row, col)
 
 
 async def _data_table_payload(
@@ -491,22 +518,18 @@ async def _data_table_payload(
     order_sql = _data_table_order_sql(columns, order_by or {}, default_order)
     where_sql = f" WHERE {where}" if where else ""
 
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
-        cur = await conn.execute(f"SELECT COUNT(*) FROM {table}")
-        total = (await cur.fetchone())[0]
+    async with engine.connect() as conn:
+        total = (await conn.execute(sa_text(f"SELECT COUNT(*) FROM {table}"))).scalar_one()
         filtered = total
         if where:
-            cur = await conn.execute(
-                f"SELECT COUNT(*) FROM {table}{where_sql}", where_args
-            )
-            filtered = (await cur.fetchone())[0]
-        cur = await conn.execute(
-            f"SELECT * FROM {table}{where_sql} "
-            f"ORDER BY {', '.join(order_sql)} LIMIT :limit OFFSET :offset",
+            filtered = (await conn.execute(
+                sa_text(f"SELECT COUNT(*) FROM {table}{where_sql}"), where_args
+            )).scalar_one()
+        rows = (await conn.execute(
+            sa_text(f"SELECT * FROM {table}{where_sql} "
+                f"ORDER BY {', '.join(order_sql)} LIMIT :limit OFFSET :offset"),
             {**where_args, "limit": length, "offset": start},
-        )
-        rows = await cur.fetchall()
+        )).fetchall()
 
     # Cells travel as display text; the client shows them as-is (sorting is
     # done server-side, so no client-side render hooks are needed).
@@ -514,7 +537,7 @@ async def _data_table_payload(
         "draw": draw,
         "recordsTotal": total,
         "recordsFiltered": filtered,
-        "data": [{col: cell(row, col) for col in columns} for row in rows],
+        "data": [{col: cell(row._mapping, col) for col in columns} for row in rows],
     }
 
 
@@ -698,12 +721,12 @@ async def login():
         form = await request.form
         name = form.get("name", "")
         password = form.get("pass", "")
-        async with aiosqlite.connect(DB_PATH) as conn:
-            row = await conn.execute_fetchall(
-                "SELECT hash, salt FROM users WHERE name = :name", {"name": name}
-            )
-        if row:
-            stored_hash, salt = row[0]
+        async with engine.connect() as conn:
+            rows = (await conn.execute(
+                sa_text("SELECT hash, salt FROM users WHERE name = :name"), {"name": name}
+            )).fetchall()
+        if rows:
+            stored_hash, salt = rows[0]._mapping["hash"], rows[0]._mapping["salt"]
             if hmac.compare_digest(_hash_password(password, salt), stored_hash):
                 session["logged_in"] = True
                 session["user"] = name
@@ -743,10 +766,10 @@ async def api_update():
         except ValueError:
             return "invalid due_date", 400
 
-    async with aiosqlite.connect(DB_PATH) as conn:
+    async with engine.connect() as conn:
         # field comes from the EDITABLE_COLUMNS whitelist, safe to interpolate
-        await conn.execute(f"UPDATE report SET {field} = :value WHERE encounter = :encounter", {"value": save_value, "encounter": enc})
-        await conn.execute(f"UPDATE encounter SET {field} = :value WHERE encounter = :encounter", {"value": save_value, "encounter": enc})
+        await conn.execute(sa_text(f"UPDATE report SET {field} = :value WHERE encounter = :encounter"), {"value": save_value, "encounter": enc})
+        await conn.execute(sa_text(f"UPDATE encounter SET {field} = :value WHERE encounter = :encounter"), {"value": save_value, "encounter": enc})
         await conn.commit()
 
     # Push the new cell value to every connected /report tab so their
@@ -768,7 +791,7 @@ async def api_claim_info():
         return "bad request", 400
 
     def _fetch():
-        con = sqlite3.connect(DB_PATH)
+        con = psycopg2.connect(PG_DSN)
         try:
             return claim_info(con, str(claim))
         finally:
@@ -786,9 +809,14 @@ async def api_lab_result():
     if not session.get("logged_in"):
         return "unauthorized", 401
     lab_id = request.args.get("id", "")
-    async with aiosqlite.connect(DB_PATH) as conn:
-        cur = await conn.execute("SELECT result FROM lab WHERE id = :lab_id", {"lab_id": lab_id})
-        row = await cur.fetchone()
+    try:
+        lab_id = int(lab_id)
+    except (TypeError, ValueError):
+        return "no such lab", 404
+    async with engine.connect() as conn:
+        row = (await conn.execute(
+            sa_text("SELECT result FROM lab WHERE id = :lab_id"), {"lab_id": lab_id}
+        )).fetchone()
     if row is None or row[0] is None:
         return "no such lab", 404
     try:

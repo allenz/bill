@@ -1,9 +1,11 @@
 import asyncio
-import sqlite3
 import sys
 
+import psycopg2
+
 import app as app_module
-from claim_info import DB_PATH, claim_info
+from claim_info import claim_info
+from config import PG_DSN
 
 
 async def main():
@@ -13,21 +15,20 @@ async def main():
     assert "store" not in sys.modules, "claim_info imported the cache store"
     assert "scrape_ecw" not in sys.modules, "claim_info imported scrape_ecw"
 
-    # encounter.claim is TEXT and can be '' for rows without a claim, so
-    # pick one that holds a real (numeric) claim number.
-    con = sqlite3.connect(DB_PATH)
-    real_claim = con.execute(
-        "SELECT claim FROM encounter WHERE claim GLOB '[0-9]*' ORDER BY claim DESC LIMIT 1"
-    ).fetchone()[0]
-    missing_claim = con.execute(
-        "SELECT IFNULL(MAX(CAST(claim AS INTEGER)), 0) + 1 FROM encounter WHERE claim GLOB '[0-9]*'"
-    ).fetchone()[0]
+    # encounter.claim is NULL for rows without a claim, so pick one that
+    # holds a real claim number.
+    con = psycopg2.connect(PG_DSN)
+    cur = con.cursor()
+    cur.execute("SELECT claim FROM encounter WHERE claim IS NOT NULL ORDER BY claim DESC LIMIT 1")
+    real_claim = cur.fetchone()[0]
+    cur.execute("SELECT COALESCE(MAX(claim), 0) + 1 FROM encounter WHERE claim IS NOT NULL")
+    missing_claim = cur.fetchone()[0]
     con.close()
 
     # direct call: real claim -> detail dict, unknown claim -> {}
-    info = claim_info(sqlite3.connect(DB_PATH), str(real_claim))
+    info = claim_info(psycopg2.connect(PG_DSN), str(real_claim))
     assert "name" in info and "DOS" in info, info
-    assert claim_info(sqlite3.connect(DB_PATH), str(missing_claim)) == {}
+    assert claim_info(psycopg2.connect(PG_DSN), str(missing_claim)) == {}
 
     client = app_module.app.test_client()
 

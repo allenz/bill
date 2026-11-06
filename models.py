@@ -1,4 +1,4 @@
-"""SQLModel tables for the billing database (billing.sqlite3)."""
+"""SQLModel tables for the billing database (PostgreSQL, `web` schema)."""
 import uuid
 from datetime import datetime
 
@@ -56,7 +56,8 @@ class Encounter(SQLModel, table=True):
 
     Rows are written by get_encounters()/add_claim() in db.py. get_encounters()
     does a sparse true_upsert (only schedule/claim cols are sent, so other
-    columns of an existing row are kept); add_claim() UPDATEs the claim cols.
+    columns of an existing row are kept); add_claim() upserts the claim cols
+    (inserts new rows for encounters not in the schedule).
     Columns map from the schedule JSON:
     encounterId -> encounter, patId -> mrn, start/apptCard.dateTime -> date
     (date part only; date is YYYY-MM-DD and used in BETWEEN/MAX),
@@ -168,13 +169,21 @@ class PayClaim(SQLModel, table=True):
     """
     __tablename__ = "pay_claim"
     __table_args__ = (
+        sa.UniqueConstraint("payment", "claim", "payment_detail"),
         sa.Index("ix_pay", "payment"),
         sa.Index("idx_payclaim_paymentdetail", "payment_detail"),
     )
 
-    payment: int | None = Field(primary_key=True)
-    claim: int | None = Field(primary_key=True)
-    payment_detail: str | None = Field(primary_key=True)
+    # Surrogate key: patient payments have claim and payment_detail NULL, and
+    # PostgreSQL (unlike SQLite) does not allow NULLs in a primary key. Rows
+    # are deleted and re-inserted per payment by db.py _set_pay(); the
+    # (payment, claim, payment_detail) tuple stays unique via the constraint
+    # below (as in SQLite, NULLs are distinct, so a payment can have several
+    # claim-less details).
+    id: int = Field(default=None, sa_column=sa.Column("id", sa.Integer, sa.Identity(always=True), primary_key=True))
+    payment: int | None = None
+    claim: int | None = None
+    payment_detail: str | None = None
     posted_date: str | None = None
     paid: float | None = None  # amount for this payment_detail, not the total payment
     payor_id: str | None = None
@@ -193,7 +202,8 @@ class PayClaim(SQLModel, table=True):
     name: str | None = None
     created: str | None = Field(
         default=None,
-        sa_column_kwargs={"server_default": sa.text("CURRENT_TIMESTAMP")},
+        # SQLite stored CURRENT_TIMESTAMP as UTC text; keep the same format.
+        sa_column_kwargs={"server_default": sa.text("to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')")},
     )
 
 
@@ -220,7 +230,8 @@ class PayCpt(SQLModel, table=True):
     date: str | None = None
     created: str | None = Field(
         default=None,
-        sa_column_kwargs={"server_default": sa.text("strftime('%Y-%m-%d %H:%M', 'now', 'localtime')")},
+        # Matches the old SQLite strftime('%Y-%m-%d %H:%M', 'now', 'localtime') default.
+        sa_column_kwargs={"server_default": sa.text("to_char(now(), 'YYYY-MM-DD HH24:MI')")},
     )
     claim: int | None = None
     payment: int | None = None
@@ -267,8 +278,9 @@ class Message(SQLModel, table=True):
     body: str | None = None
     media_urls: list[str] | None = Field(default=None, sa_type=sa.JSON)
     status: str = Field(max_length=30)
-    created_at: datetime
-    updated_at: datetime
+    # Stored in PostgreSQL as TIMESTAMPTZ (values are UTC).
+    created_at: datetime = Field(sa_type=sa.DateTime(timezone=True))
+    updated_at: datetime = Field(sa_type=sa.DateTime(timezone=True))
 
     @classmethod
     def from_webhook(cls, data: dict[str, str]) -> "Message":
@@ -292,9 +304,27 @@ class Message(SQLModel, table=True):
 
 class Block(SQLModel, table=True):
     """Block on calendar to prevent appointments."""
-    id: int | None = Field(default=None, primary_key=True)
+    # id autoincrements (SQLite rowid equivalent); the table is currently empty
+    id: int = Field(default=None, sa_column=sa.Column("id", sa.Integer, sa.Identity(always=True), primary_key=True))
     start: datetime = Field(nullable=False)
     end: datetime = Field(nullable=False)
     title: str = Field(nullable=False)
     comments: str = Field(nullable=False)
     encounter_count: int = Field(nullable=False)
+
+
+class Insurance(SQLModel, table=True):
+    """One insurance company, hand-maintained. Joined from the report and
+    claim_info queries on the (trimmed) patient.insurance name."""
+    insurance: str = Field(primary_key=True)
+    phone: str | None = None
+    party: str | None = None  # 1P or 3P
+    ppo: int | None = None  # 1 for PPO plans, 0 otherwise
+    comment: str | None = None
+
+
+class Users(SQLModel, table=True):
+    """Login for the web app (app.py /login, PBKDF2-SHA256)."""
+    name: str = Field(primary_key=True)
+    hash: str
+    salt: str

@@ -2,9 +2,12 @@ import html
 import re
 from datetime import date
 
-import aiosqlite
+from sqlalchemy import text as sa_text
+from sqlalchemy.ext.asyncio import create_async_engine
 
-DB_PATH = "/srv/allen/ecw/billing.sqlite3"
+from config import DATABASE_URL_ASYNC
+
+engine = create_async_engine(DATABASE_URL_ASYNC)
 
 REPORT_COLUMNS = [
     "due_date", "assignee", "task", "notes", "claim", "date", "name", "reason", "mrn", "insurance",
@@ -46,18 +49,15 @@ EDITABLE_COLUMNS = {"due_date", "assignee", "task", "notes"}
 
 
 async def render_reports(months, cutoff):
-    async with aiosqlite.connect(DB_PATH) as conn:
-        conn.row_factory = aiosqlite.Row
+    async with engine.connect() as conn:
         if months is None:
-            cur = await conn.execute("SELECT * FROM report ORDER BY date ASC")
-            rows = await cur.fetchall()
+            rows = (await conn.execute(sa_text("SELECT * FROM report ORDER BY date ASC"))).fetchall()
             since = "(all time)"
         else:
-            cur = await conn.execute(
-                "SELECT * FROM report WHERE date >= :cutoff ORDER BY date ASC",
+            rows = (await conn.execute(
+                sa_text("SELECT * FROM report WHERE date >= :cutoff ORDER BY date ASC"),
                 {"cutoff": cutoff},
-            )
-            rows = await cur.fetchall()
+            )).fetchall()
             since = cutoff
 
     header = "".join(
@@ -65,6 +65,7 @@ async def render_reports(months, cutoff):
     )
     body_rows = []
     for row in rows:
+        row = row._mapping
         tds = []
         for col in REPORT_COLUMNS:
             if col in EDITABLE_COLUMNS and row["encounter"] is not None:

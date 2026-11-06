@@ -1,8 +1,7 @@
 """Pull info from db needed to call insurance about a claim."""
-import sqlite3
-from pathlib import Path
+import psycopg2
 
-from config import DB_PATH
+from config import PG_DSN
 
 DATA = """
 Hee, June, T	55652
@@ -11,6 +10,10 @@ Chiu, Chih He	55654
 
 
 def claim_info(con, claim: str) -> dict[str, str]:
+	"""con is a psycopg2 connection to the billing db; claim is a claim number.
+
+	The claim is passed as a bound parameter (encounter.claim is INTEGER).
+	"""
 	sql = '''SELECT
 		encounter.date, encounter.billed, patient.name, patient.dob, patient.ssn, patient.zipcode AS zip,
 		patient.insurance, insurance.phone,
@@ -20,28 +23,29 @@ def claim_info(con, claim: str) -> dict[str, str]:
 	FROM encounter
 	LEFT JOIN patient USING (mrn)
 	LEFT JOIN insurance
-	ON TRIM(
+	ON TRIM(BOTH '- ' FROM
 		CASE
-		WHEN TRIM(patient.insurance) LIKE '%Health Care-Brown and Toland'
+		WHEN TRIM(patient.insurance) LIKE '%%Health Care-Brown and Toland'
 			THEN SUBSTR(TRIM(patient.insurance), 1, LENGTH(TRIM(patient.insurance)) - LENGTH('Health Care-Brown and Toland'))
-		WHEN TRIM(patient.insurance) LIKE '%Brown and Toland'
+		WHEN TRIM(patient.insurance) LIKE '%%Brown and Toland'
 			THEN SUBSTR(TRIM(patient.insurance), 1, LENGTH(TRIM(patient.insurance)) - LENGTH('Brown and Toland'))
-		WHEN TRIM(patient.insurance) LIKE '%Health Care'
+		WHEN TRIM(patient.insurance) LIKE '%%Health Care'
 			THEN SUBSTR(TRIM(patient.insurance), 1, LENGTH(TRIM(patient.insurance)) - LENGTH('Health Care'))
-		WHEN TRIM(patient.insurance) LIKE '%Health Plan'
+		WHEN TRIM(patient.insurance) LIKE '%%Health Plan'
 			THEN SUBSTR(TRIM(patient.insurance), 1, LENGTH(TRIM(patient.insurance)) - LENGTH('Health Plan'))
 		ELSE TRIM(patient.insurance)
-	END, "- "
+	END
 	) = insurance.insurance
-	WHERE claim = {claim};
-	'''.format(claim=claim)
-
-	rows = list(con.execute(sql))
-	if not rows:
+	WHERE claim = %(claim)s
+	'''
+	cur = con.cursor()
+	cur.execute(sql, {'claim': int(claim)})
+	row = cur.fetchone()
+	if row is None:
 		return {}
 
 	D = {}
-	D['DOS'], D['billed'], D['name'], D['dob'], D['ssn'], D['zip'], D['insurance'], D['phone'], D['npi'], D['tax_id'], D['member_id'], D['group_id'], D['coinsurance'] = rows[0]
+	D['DOS'], D['billed'], D['name'], D['dob'], D['ssn'], D['zip'], D['insurance'], D['phone'], D['npi'], D['tax_id'], D['member_id'], D['group_id'], D['coinsurance'] = row
 	del D['coinsurance']
 
 	# reorder keys
@@ -90,5 +94,6 @@ if __name__ == "__main__":
 		r = row.split('\t')
 		claims.append(r[-1])
 
-	con = sqlite3.connect(DB_PATH)
+	con = psycopg2.connect(PG_DSN)
 	claims_info(con, claims)
+	con.close()

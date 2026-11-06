@@ -1,15 +1,16 @@
 from datetime import date, timedelta
-import sqlite3
 
 from ecw_session import ESession
-from scrape_ecw import Client, DIR
+from scrape_ecw import Client
 from sqlmodel import Session, create_engine
 from db import update_all, report
+from config import DATABASE_URL
 
 
 if __name__ == "__main__":
-  con = sqlite3.connect(DIR / "billing.sqlite3")
-  session = Session(create_engine(f"sqlite:///{DIR / 'billing.sqlite3'}"))
+  engine = create_engine(DATABASE_URL)
+  session = Session(engine)
+  con = engine.connect()
   with ESession() as esession:
     client = Client(esession)
     update_all(session, client)

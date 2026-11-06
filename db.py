@@ -4,7 +4,6 @@ from bs4 import BeautifulSoup
 from datetime import date, datetime, timedelta
 import pandas as pd
 from pathlib import Path
-import sqlite3
 import json
 import os
 from sqlmodel import Session, create_engine, SQLModel
@@ -15,7 +14,7 @@ from tqdm import tqdm
 from typing import TypeVar
 
 from ecw_session import ESession
-from config import DIR, DB_PATH
+from config import DATABASE_URL
 from scrape_ecw import Client, CACHE, clean_interface_status, get_claim, get_claim_data, download_claims_overview, KNOWN_MISSING_PT, to_int, to_float
 from claim_info import claim_info
 from parse_claim import parse_claim
@@ -59,6 +58,7 @@ def iso_date(s: str) -> str:
 
 
 def date_range(from_date: str, to_date: str) -> list[str]:
+  # Inclusive of from_date, exclusive of to_date (like range()).
   date = datetime.strptime(from_date, '%Y-%m-%d')
   dates = []
   while date < datetime.strptime(to_date, '%Y-%m-%d'):
@@ -340,16 +340,17 @@ def update_lab_result(session: Session, client, lab_id: int, report_type: int = 
 
 
 def update_all(session, client: Client):
-  today = date.today().strftime('%Y-%m-%d')
-  tomorrow = (date.today() + timedelta(days=1)).strftime('%Y-%m-%d')
-  from_date = session.execute(sa.text('SELECT MAX(date) FROM encounter')).scalar() or today
+  # Get data from yesterday, since today might not have full data.
+  today = date.today()
+  yesterday = today - timedelta(days=1)
+  from_date = session.execute(sa.text('SELECT MAX(date) FROM encounter')).scalar() or yesterday.strftime('%Y-%m-%d')
   # use the payments page to update CPTs
-  mrn_claims = get_encounters(session, client, from_date, tomorrow)
+  mrn_claims = get_encounters(session, client, from_date, today.strftime('%Y-%m-%d'))
 
-  # update db: if today has no payments yet, try yesterday, then the day before
+  # update db: if yesterday has no payments yet, try the day before, then two days before
   pay_ids = set()
-  for offset in range(3):
-    d = (date.today() - timedelta(days=offset)).strftime('%Y-%m-%d')
+  for offset in range(1, 4):
+    d = (today - timedelta(days=offset)).strftime('%Y-%m-%d')
     payments = BeautifulSoup(client.get_ins_payments(from_date=d, to_date=d), 'xml')
     pay_ids = set(int(pay.paymentId.text) for pay in payments.find_all('payment'))
     if pay_ids:
@@ -380,7 +381,7 @@ def report_encounter(con, start_date: str, end_date: str, claim: str = '') -> pd
     FROM encounter
     LEFT JOIN patient USING (mrn)
     LEFT JOIN insurance
-    ON TRIM(
+    ON TRIM(BOTH '- ' FROM
       CASE
       WHEN TRIM(patient.insurance) LIKE '%Health Care-Brown and Toland'
         THEN SUBSTR(TRIM(patient.insurance), 1, LENGTH(TRIM(patient.insurance)) - LENGTH('Health Care-Brown and Toland'))
@@ -397,14 +398,16 @@ def report_encounter(con, start_date: str, end_date: str, claim: str = '') -> pd
       WHEN TRIM(patient.insurance) LIKE '%Health Plan'
         THEN SUBSTR(TRIM(patient.insurance), 1, LENGTH(TRIM(patient.insurance)) - LENGTH('Health Plan'))
       ELSE TRIM(patient.insurance)
-    END, "- "
+    END
     ) = insurance.insurance
     WHERE encounter.mrn != 9128
     AND encounter.date BETWEEN '{start_date}' AND '{end_date}'
     {claim_clause}
-    ORDER BY encounter.claim;
+    ORDER BY encounter.claim
   '''.format(start_date=start_date, end_date=end_date, claim_clause=claim_clause)
-  return pd.read_sql(sql, con)
+  # sa.text so pandas uses the compiled-SQL path: a plain driver string makes
+  # psycopg2 %-interpolate the statement, which breaks the literal % in LIKE.
+  return pd.read_sql(sa.text(sql), con)
 
 
 def report_claim_pay(con, claim: str = ''):
@@ -413,8 +416,8 @@ def report_claim_pay(con, claim: str = ''):
   Payments deleted in ECW (pay.deleted = 1) are ignored, along with their
   pay_claim and pay_cpt rows (a NULL deleted is not deleted).
   """
-  con.execute('DROP TABLE IF EXISTS paid;')
-  con.execute('''
+  con.execute(sa.text('DROP TABLE IF EXISTS paid;'))
+  con.execute(sa.text('''
     CREATE TEMPORARY TABLE paid AS
     SELECT pc.claim, pc.cpt, MAX(pc.name) AS name, SUM(pc.paid) AS paid
     FROM pay_cpt pc
@@ -423,10 +426,10 @@ def report_claim_pay(con, claim: str = ''):
       WHERE p.payment = pc.payment AND p.deleted
     )
     GROUP BY pc.claim, pc.cpt;
-  ''')
-  con.execute('CREATE INDEX IF NOT EXISTS tmp_ix_p ON paid(claim, cpt);')
-  con.execute('DROP TABLE IF EXISTS deduct;')
-  con.execute('''
+  '''))
+  con.execute(sa.text('CREATE INDEX IF NOT EXISTS tmp_ix_p ON paid(claim, cpt);'))
+  con.execute(sa.text('DROP TABLE IF EXISTS deduct;'))
+  con.execute(sa.text('''
     CREATE TEMPORARY TABLE deduct AS
     SELECT pc.claim, SUM(pc.deduct) AS deduct
     FROM pay_claim pc
@@ -436,8 +439,8 @@ def report_claim_pay(con, claim: str = ''):
     )
     AND pc.deduct > 0
     GROUP BY pc.claim;
-  ''')
-  con.execute('CREATE INDEX IF NOT EXISTS tmp_ix_d ON deduct(claim);')
+  '''))
+  con.execute(sa.text('CREATE INDEX IF NOT EXISTS tmp_ix_d ON deduct(claim);'))
 
   claim_clause = f' AND claim={claim}' if claim else ''
 
@@ -476,9 +479,9 @@ def report_claim_pay(con, claim: str = ''):
     LEFT JOIN D USING (claim)
     ORDER BY claim;
   '''.format(claim_clause=claim_clause)
-  df = pd.read_sql(sql, con)
-  con.execute('DROP TABLE paid;')
-  con.execute('DROP TABLE deduct;')
+  df = pd.read_sql(sa.text(sql), con)
+  con.execute(sa.text('DROP TABLE paid;'))
+  con.execute(sa.text('DROP TABLE deduct;'))
   return df
 
 
@@ -523,7 +526,7 @@ def get_report(con, start_date: str, end_date: str, claim: str = '') -> pd.DataF
     AND pc.paid > 10
     GROUP BY pc.claim
   '''.format(start_date=start_date)
-  pt_df = pd.read_sql(sql, con)
+  pt_df = pd.read_sql(sa.text(sql), con)
 
   df = pd.merge(df, pt_df, how='left', on='claim')
 
@@ -557,7 +560,7 @@ def get_report(con, start_date: str, end_date: str, claim: str = '') -> pd.DataF
   df.sort_values(by=['date', 'p'], inplace=True)
 
   # materialize the report as a table in the db
-  con.execute('DROP TABLE IF EXISTS report')
+  con.execute(sa.text('DROP TABLE IF EXISTS report'))
   df.to_sql('report', con, index=False)
   con.commit()
 
@@ -584,19 +587,20 @@ def report(con, session, client, start_date: str, end_date: str, claim: str = ''
   # df = df[(df.ppo == 1) & df.claim.notna() & (df.billed > 0)]
   # claims_info(con, df['claim'].tolist(), REPORT_DIR / 'claims_info.txt')
 
-def add_claim(session: Session, client, date: str, refresh: bool = False) -> list[tuple[str, str]]:
-  xml = client.getClaimsList(date, '0', refresh=refresh)
-  q = "UPDATE encounter SET mrn = :mrn, claim = :claim, billed = :billed, paid = :paid, balance = :balance WHERE encounter = :encounter"
+def add_claim(session: Session, client, date: str, refresh: bool = False, date_option: str = '1') -> list[tuple[int, int]]:
+  # By default we use claim date = recently created claims.
+  xml = client.getClaimsList(date, date_option, refresh=refresh)
   claims = xml.find_all('claim')
   for c in claims:
     assert not c.DueDate.text, f"due date {c}"
     assert not c.AssignedTo.text, f"assignee {c}"
-  rows = [{'mrn': to_int(c.PatientAccNo.text), 'claim': c.ClaimId.text, 'billed': c.amount.text, 'paid': c.payment.text, 'balance': c.balance.text, 'encounter': c.EncounterId.text} for c in claims]
+  rows = [{'mrn': to_int(c.PatientAccNo.text), 'claim': to_int(c.ClaimId.text), 'billed': c.amount.text, 'paid': c.payment.text, 'balance': c.balance.text, 'encounter': to_int(c.EncounterId.text)} for c in claims]
   assert len(rows) < 100  # query MAXCOUNT
+  for r in rows:
+    upsert(session, Encounter, r, key='encounter')
+  session.commit()
   if not rows:  # no claims this date; executing with [] raises InvalidRequestError
     return []
-  session.execute(sa.text(q), rows)
-  session.commit()
   mrn_claims = [(r['mrn'], r['claim']) for r in rows]
   assert all(c != 0 for m, c in mrn_claims)
   add_claim_cpt(session, client, mrn_claims)
@@ -623,8 +627,7 @@ def add_claim(session: Session, client, date: str, refresh: bool = False) -> lis
 
 
 if __name__ == "__main__":
-  # con = sqlite3.connect(DB_PATH)
-  engine = create_engine(f"sqlite:///{DB_PATH}")
+  engine = create_engine(DATABASE_URL)
   session = Session(engine)
 
   with ESession() as esession:
